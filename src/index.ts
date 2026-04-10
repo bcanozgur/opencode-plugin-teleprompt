@@ -1,9 +1,4 @@
 import { tui } from "./tui.js";
 
-const plugin = {
-  id: "teleprompt",
-  tui,
-};
-
-export default plugin;
+export default { tui };
 export { tui };
