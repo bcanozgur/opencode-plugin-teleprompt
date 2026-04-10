@@ -1,0 +1,55 @@
+{
+  "name": "opencode-plugin-teleprompt",
+  "version": "0.1.0",
+  "description": "OpenCode TUI plugin to bridge a Telegram channel with the active session",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bcanozgur/opencode-plugin-teleprompt.git"
+  },
+  "homepage": "https://github.com/bcanozgur/opencode-plugin-teleprompt#readme",
+  "bugs": {
+    "url": "https://github.com/bcanozgur/opencode-plugin-teleprompt/issues"
+  },
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "telegram",
+    "tui"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "verify:release": "npm run typecheck && npm run build && npm pack --dry-run",
+    "prepublishOnly": "npm run verify:release"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^0.6.0",
+    "@opencode-ai/sdk": "^0.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "opencode-plugin-teleprompt": "file:",
+    "typescript": "^5.8.3"
+  }
+}
