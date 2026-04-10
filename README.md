@@ -21,9 +21,9 @@ TUI-scoped OpenCode plugin that binds a Telegram channel to one active OpenCode 
 
 - Telegram bot token
 - Bot must be an admin in the target channel
-- Environment variables:
-  - `OPENCODE_TELEGRAM_BOT_TOKEN`
-  - `OPENCODE_TELEGRAM_CHANNEL_ID`
+- Telegram credentials can be provided either:
+  - via env vars (`OPENCODE_TELEGRAM_BOT_TOKEN`, `OPENCODE_TELEGRAM_CHANNEL_ID`)
+  - or at runtime with `/tp:start <bot_token> <channel_id>` or `/tp:credentials <bot_token> <channel_id>`
 
 Optional:
 
@@ -62,6 +62,8 @@ OpenCode installs npm plugins automatically at startup.
 2. Add package name to `opencode.json` as shown above.
 3. Open a session in OpenCode TUI.
 4. Run `/tp:start` in OpenCode to activate teleprompt for the current session.
+   - If env vars are missing, run `/tp:start <bot_token> <channel_id>` once (or `/tp:credentials <bot_token> <channel_id>` then `/tp:start`).
+   - Runtime credentials are session-only and are cleared on plugin/session shutdown.
 5. While teleprompt is active, local prompt input is locked for that session.
 6. Disconnect options:
    - Press `Esc` twice in a row in OpenCode
@@ -140,6 +142,8 @@ During remote runs, teleprompt posts lifecycle updates (`accepted`, `queued`, `r
 ### OpenCode Local Commands
 
 - `/tp:start`: Bind teleprompt to the current OpenCode session and start Telegram polling.
+- `/tp:start <bot_token> <channel_id>`: Bind with session-only credentials when env vars are not set.
+- `/tp:credentials <bot_token> <channel_id>`: Store session-only credentials for the current runtime.
 - `/tp:stop`: Unbind teleprompt, stop polling, and unlock local session input.
 - `/tp:status`: Show current bridge status in OpenCode (session, owner, model, queue, permissions).
 
