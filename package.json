@@ -1,7 +1,7 @@
 {
   "name": "opencode-plugin-teleprompt",
   "version": "0.1.0",
-  "description": "OpenCode TUI plugin to bridge a Telegram channel with the active session",
+  "description": "OpenCode TUI plugin — control your AI coding session remotely via Telegram. Queue prompts, approve permissions, and get results as Telegram messages.",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
