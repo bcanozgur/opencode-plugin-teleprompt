@@ -27,16 +27,9 @@ export function loadConfig(): BridgeConfig {
   const botToken = process.env.OPENCODE_TELEGRAM_BOT_TOKEN?.trim();
   const channelID = process.env.OPENCODE_TELEGRAM_CHANNEL_ID?.trim();
   const prefix = "/tp";
-
-  if (!botToken) {
-    throw new Error("Missing OPENCODE_TELEGRAM_BOT_TOKEN");
-  }
-  if (!channelID) {
-    throw new Error("Missing OPENCODE_TELEGRAM_CHANNEL_ID");
-  }
   return {
-    botToken,
-    channelID,
+    botToken: botToken || "",
+    channelID: channelID || "",
     prefix,
     pollTimeoutSec: readNumber("OPENCODE_TELEGRAM_POLL_TIMEOUT_SEC", 30),
     heartbeatMs: readNumber("OPENCODE_TELEGRAM_HEARTBEAT_MS", 10_000),

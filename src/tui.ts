@@ -78,6 +78,23 @@ export const tui: TuiPlugin = async (
         void runSafe(api, async () => controller.statusLine());
       },
     },
+    {
+      title: "Teleprompt: Credentials",
+      value: "tp:credentials",
+      description: "Set session-only Telegram credentials",
+      category: "Teleprompt",
+      slash: {
+        name: "tp:credentials",
+        aliases: ["telegram.credentials"],
+      },
+      onSelect: () => {
+        api.ui.toast({
+          variant: "info",
+          message:
+            "Usage: /tp:credentials <bot_token> <channel_id> then /tp:start",
+        });
+      },
+    },
   ]);
 
   const unsubscribeTuiCommand = api.event.on("tui.command.execute", (event) => {

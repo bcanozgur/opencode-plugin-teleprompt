@@ -35,6 +35,11 @@ type AvailableModel = {
   name?: string;
 };
 
+type SessionCredentials = {
+  botToken: string;
+  channelID: string;
+};
+
 function formatAgeMs(ms: number): string {
   if (ms < 1000) return `${ms}ms`;
   const seconds = Math.floor(ms / 1000);
@@ -131,7 +136,7 @@ export class BridgeController {
   private readonly deps: RuntimeDeps;
   private readonly instanceID: string;
   private readonly client: any;
-  private readonly telegram: TelegramApi;
+  private telegram: TelegramApi;
   private readonly store: BridgeStore;
   private readonly lease: LeaseManager;
   private data?: BridgeStoreData;
@@ -143,6 +148,7 @@ export class BridgeController {
   private readonly shutdownOnce = createShutdownGuard();
   private processingQueue = false;
   private lastEscAt = 0;
+  private sessionCredentials?: SessionCredentials;
 
   constructor(
     private readonly api: TuiPluginApi,
@@ -153,8 +159,8 @@ export class BridgeController {
     this.deps = { ...DEFAULT_DEPS, ...deps };
     this.instanceID = this.deps.randomID();
     this.client = api.client;
-    this.telegram = new TelegramApi(config.botToken);
-    this.store = new BridgeStore(storePath, config.channelID);
+    this.telegram = new TelegramApi(config.botToken || "__missing_token__");
+    this.store = new BridgeStore(storePath, config.channelID ?? "");
     this.lease = new LeaseManager(
       this.instanceID,
       this.deps.now,
@@ -166,20 +172,28 @@ export class BridgeController {
     this.data = await this.store.load();
   }
 
-  async bindCurrent(): Promise<string> {
+  async bindCurrent(credentials?: SessionCredentials): Promise<string> {
+    const resolvedCredentials = this.resolveCredentials(credentials);
+    this.sessionCredentials = resolvedCredentials;
+    this.telegram = new TelegramApi(resolvedCredentials.botToken);
+    this.config.botToken = resolvedCredentials.botToken;
+    this.config.channelID = resolvedCredentials.channelID;
+    this.store.setChannelID(resolvedCredentials.channelID);
+
     const sessionID = getCurrentSessionID(this.api);
     const state = await this.syncState();
     const claimed = this.lease.claim(state);
     claimed.bound.sessionID = sessionID;
     claimed.bound.status = "online";
     claimed.bound.model = undefined;
+    claimed.bound.channelID = resolvedCredentials.channelID;
     await this.persist(claimed);
     this.startHeartbeat();
     await this.startEventStream(sessionID);
     this.startPolling();
     if (this.config.onlineNotice) {
-      await this.telegram.sendMessage(
-        this.config.channelID,
+      await this.getTelegramApi().sendMessage(
+        this.requireChannelID(),
         `OpenCode Telegram bridge online.\nsession_id: ${sessionID}`,
       );
     }
@@ -423,16 +437,37 @@ export class BridgeController {
         },
       });
       await this.persist(next);
-      if (this.config.offlineNotice && next.bound.sessionID) {
+      if (this.config.offlineNotice && next.bound.sessionID && this.config.channelID) {
         await this.telegram.sendMessage(
           this.config.channelID,
           `OpenCode Telegram bridge offline.\nsession_id: ${next.bound.sessionID}`,
         );
       }
+      this.sessionCredentials = undefined;
     });
   }
 
   async handleLocalTuiCommand(command: string): Promise<void> {
+    const startWithCredentials = this.parseStartWithCredentials(command);
+    if (startWithCredentials) {
+      const sessionID = await this.bindCurrent(startWithCredentials);
+      this.api.ui.toast({
+        variant: "success",
+        message: `Telegram bridge bound to session ${sessionID}`,
+      });
+      return;
+    }
+
+    const credentialOnly = this.parseCredentialCommand(command);
+    if (credentialOnly) {
+      this.sessionCredentials = credentialOnly;
+      this.api.ui.toast({
+        variant: "success",
+        message: "Teleprompt credentials set for this runtime. Run /tp:start.",
+      });
+      return;
+    }
+
     const state = await this.syncState();
     if (state.bound.status !== "online" || !state.bound.sessionID) return;
     if (command !== "session.interrupt" && command !== "prompt.clear") return;
@@ -1352,10 +1387,11 @@ export class BridgeController {
 
   private startPolling(): void {
     if (this.pollTask) return;
+    const telegram = this.getTelegramApi();
     this.pollAbort = new AbortController();
     const poller = new TelegramPoller(
-      this.telegram,
-      this.config.channelID,
+      telegram,
+      this.requireChannelID(),
       this.config.prefix,
       this.config.pollTimeoutSec,
       {
@@ -1417,6 +1453,63 @@ export class BridgeController {
         });
       }
     }, 1500);
+  }
+
+  private normalizeLocalCommand(command: string): string {
+    const trimmed = command.trim();
+    if (!trimmed.startsWith("/")) return trimmed;
+    return trimmed.slice(1);
+  }
+
+  private splitCommandArgs(command: string): string[] {
+    return this.normalizeLocalCommand(command).split(/\s+/).filter(Boolean);
+  }
+
+  private parseCredentialArgs(parts: string[]): SessionCredentials | undefined {
+    if (parts.length < 3) return undefined;
+    const botToken = parts[1]?.trim();
+    const channelID = parts[2]?.trim();
+    if (!botToken || !channelID) return undefined;
+    return { botToken, channelID };
+  }
+
+  private parseStartWithCredentials(command: string): SessionCredentials | undefined {
+    const parts = this.splitCommandArgs(command);
+    if (parts[0] !== "tp:start") return undefined;
+    return this.parseCredentialArgs(parts);
+  }
+
+  private parseCredentialCommand(command: string): SessionCredentials | undefined {
+    const parts = this.splitCommandArgs(command);
+    if (parts[0] !== "tp:credentials") return undefined;
+    return this.parseCredentialArgs(parts);
+  }
+
+  private resolveCredentials(credentials?: SessionCredentials): SessionCredentials {
+    const botToken = credentials?.botToken?.trim()
+      || this.sessionCredentials?.botToken?.trim()
+      || this.config.botToken?.trim();
+    const channelID = credentials?.channelID?.trim()
+      || this.sessionCredentials?.channelID?.trim()
+      || this.config.channelID?.trim();
+    if (!botToken || !channelID) {
+      throw new Error(
+        "Missing Telegram credentials. Set env vars or run /tp:start <bot_token> <channel_id> (or /tp:credentials <bot_token> <channel_id>) for this session.",
+      );
+    }
+    return { botToken, channelID };
+  }
+
+  private getTelegramApi(): TelegramApi {
+    return this.telegram;
+  }
+
+  private requireChannelID(): string {
+    const channelID = this.config.channelID?.trim();
+    if (!channelID) {
+      throw new Error("Telegram channel id is not configured.");
+    }
+    return channelID;
   }
 
   private async stopRuntime(clearJobs: boolean): Promise<void> {

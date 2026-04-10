@@ -21,8 +21,12 @@ function createDefaultStore(channelID: string): BridgeStoreData {
 export class BridgeStore {
   constructor(
     private readonly filePath: string,
-    private readonly channelID: string,
+    private channelID: string,
   ) {}
+
+  setChannelID(channelID: string): void {
+    this.channelID = channelID;
+  }
 
   async load(): Promise<BridgeStoreData> {
     try {
