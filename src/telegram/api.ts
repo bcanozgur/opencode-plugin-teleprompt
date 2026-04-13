@@ -27,7 +27,6 @@ export class TelegramApi {
     const payload = {
       offset,
       timeout: timeoutSec,
-      allowed_updates: ["channel_post"],
     };
     const response = await this.post<GetUpdatesResult>(
       "/getUpdates",
@@ -35,6 +34,13 @@ export class TelegramApi {
       signal,
     );
     return response;
+  }
+
+  async getLatestUpdateOffset(signal?: AbortSignal): Promise<number | undefined> {
+    const updates = await this.getUpdates(-1, 0, signal);
+    if (updates.length === 0) return undefined;
+    const latest = updates.reduce((max, update) => Math.max(max, update.update_id), 0);
+    return latest + 1;
   }
 
   async sendMessage(
@@ -53,8 +59,8 @@ export class TelegramApi {
           disable_web_page_preview: true,
           ...(index === 0 && options?.replyToMessageID
             ? {
-                reply_to_message_id: options.replyToMessageID,
-              }
+              reply_to_message_id: options.replyToMessageID,
+            }
             : {}),
         },
         signal,

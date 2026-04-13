@@ -6,6 +6,7 @@ type PollerHandlers = {
   onCommand: (command: ParsedTelegramCommand) => Promise<void>;
   onOffset: (offset: number) => Promise<void>;
   onError: (error: unknown) => void;
+  onUpdates?: (count: number) => void;
 };
 
 export class TelegramPoller {
@@ -23,6 +24,9 @@ export class TelegramPoller {
       try {
         const updates = await this.api.getUpdates(offset, this.timeoutSec, signal);
         if (signal.aborted) break;
+        if (updates.length > 0) {
+          this.handlers.onUpdates?.(updates.length);
+        }
         offset = await this.processUpdates(offset, updates);
       } catch (error) {
         if (signal.aborted) break;

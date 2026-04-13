@@ -74,6 +74,7 @@ export type BridgeStoreData = {
 
 export type TelegramUpdate = {
   update_id: number;
+  message?: TelegramChannelPost;
   channel_post?: TelegramChannelPost;
 };
 
@@ -160,6 +161,10 @@ export type TelegramCommandLastError = {
   kind: "last-error";
 };
 
+export type TelegramCommandVersion = {
+  kind: "version";
+};
+
 export type TelegramCommandModel = {
   kind: "model";
   target?: {
@@ -187,6 +192,7 @@ export type TelegramCommand =
   | TelegramCommandReclaim
   | TelegramCommandHistory
   | TelegramCommandLastError
+  | TelegramCommandVersion
   | TelegramCommandModel;
 
 export type ParsedTelegramCommand = {

@@ -9,7 +9,7 @@ import type {
   RuntimeDeps,
   SummaryPayload,
 } from "../types.js";
-import { getCurrentSessionID } from "../opencode/binding.js";
+import { getCurrentOrCreateSessionID } from "../opencode/binding.js";
 import { replyPermission, toPendingPermission, formatPermissionRequestMessage } from "../opencode/permissions.js";
 import { createTelegramUserMessageID, submitPrompt } from "../opencode/submit.js";
 import { formatSummaryForTelegram } from "../summary/format.js";
@@ -20,6 +20,7 @@ import { TelegramPoller } from "../telegram/poller.js";
 import { SessionEventStream } from "../opencode/events.js";
 import { createShutdownGuard } from "./shutdown.js";
 import type { TuiPluginApi } from "../tui-types.js";
+import { PLUGIN_VERSION } from "../version.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -149,6 +150,7 @@ export class BridgeController {
   private processingQueue = false;
   private lastEscAt = 0;
   private sessionCredentials?: SessionCredentials;
+  private activePromptCheckInFlight = false;
 
   constructor(
     private readonly api: TuiPluginApi,
@@ -180,17 +182,20 @@ export class BridgeController {
     this.config.channelID = resolvedCredentials.channelID;
     this.store.setChannelID(resolvedCredentials.channelID);
 
-    const sessionID = getCurrentSessionID(this.api);
+    const sessionID = await getCurrentOrCreateSessionID(this.api, this.client);
     const state = await this.syncState();
     const claimed = this.lease.claim(state);
-    claimed.bound.sessionID = sessionID;
-    claimed.bound.status = "online";
-    claimed.bound.model = undefined;
-    claimed.bound.channelID = resolvedCredentials.channelID;
-    await this.persist(claimed);
+    const next = this.resetBoundSessionState(
+      claimed,
+      sessionID,
+      resolvedCredentials.channelID,
+    );
+    await this.persist(next);
+    await this.skipTelegramBacklog();
     this.startHeartbeat();
     await this.startEventStream(sessionID);
     this.startPolling();
+    await this.clearTuiPrompt();
     if (this.config.onlineNotice) {
       await this.getTelegramApi().sendMessage(
         this.requireChannelID(),
@@ -257,7 +262,7 @@ export class BridgeController {
   async handleTelegramCommand(command: ParsedTelegramCommand): Promise<void> {
     const state = await this.syncState();
     const isOwner = this.lease.isOwner(state);
-    const alwaysAllowed = new Set(["status", "who", "health", "reclaim"]);
+    const alwaysAllowed = new Set(["status", "who", "health", "reclaim", "version"]);
     if (!isOwner && !alwaysAllowed.has(command.command.kind)) {
       await this.telegram.sendMessage(
         this.config.channelID,
@@ -271,6 +276,15 @@ export class BridgeController {
       await this.telegram.sendMessage(
         this.config.channelID,
         await this.statusLine(),
+        { replyToMessageID: command.messageID },
+      );
+      return;
+    }
+
+    if (command.command.kind === "version") {
+      await this.telegram.sendMessage(
+        this.config.channelID,
+        this.versionLine(),
         { replyToMessageID: command.messageID },
       );
       return;
@@ -451,9 +465,18 @@ export class BridgeController {
     const startWithCredentials = this.parseStartWithCredentials(command);
     if (startWithCredentials) {
       const sessionID = await this.bindCurrent(startWithCredentials);
+      await this.clearTuiPrompt();
       this.api.ui.toast({
         variant: "success",
         message: `Telegram bridge bound to session ${sessionID}`,
+      });
+      return;
+    }
+
+    if (this.isVersionCommand(command)) {
+      this.api.ui.toast({
+        variant: "info",
+        message: this.versionLine(),
       });
       return;
     }
@@ -516,18 +539,27 @@ export class BridgeController {
           promptQueue: state.promptQueue.slice(1),
         };
         await this.persist(next);
+        this.api.ui.toast({
+          variant: "info",
+          message: `Teleprompt: sending prompt to session ${state.bound.sessionID}...`,
+        });
         await this.telegram.sendMessage(
           this.config.channelID,
           "running",
           { replyToMessageID: activeJob.telegramMessageID },
         );
         try {
-          await submitPrompt(
+          const submitted = await submitPrompt(
             this.client,
             state.bound.sessionID,
             job.prompt,
             job.telegramUpdateID,
             state.bound.model,
+          );
+          await this.waitForPromptCompletion(
+            state.bound.sessionID,
+            submitted.userMessageID,
+            submitted.assistantMessageID,
           );
         } catch (error) {
           const latest = await this.requireState();
@@ -566,16 +598,29 @@ export class BridgeController {
     assistantMessageID: string,
     parentUserMessageID: string,
   ): Promise<void> {
+    await this.completeActivePrompt(
+      sessionID,
+      assistantMessageID,
+      parentUserMessageID,
+    );
+  }
+
+  private async completeActivePrompt(
+    sessionID: string,
+    assistantMessageID: string,
+    diffMessageID: string,
+    directParts?: ReadonlyArray<{ type: string; [key: string]: unknown }>,
+  ): Promise<void> {
     const state = await this.syncState();
     if (!this.lease.isOwner(state)) return;
     if (!state.activePrompt) return;
-    if (state.activePrompt.userMessageID !== parentUserMessageID) return;
     if (state.bound.sessionID !== sessionID) return;
 
     const summary = await this.buildSummary(
       sessionID,
       assistantMessageID,
-      state.activePrompt.userMessageID,
+      diffMessageID,
+      directParts,
     );
     const completedAt = this.deps.now();
     const elapsed = completedAt - (state.activePrompt.startedAt ?? state.activePrompt.createdAt);
@@ -619,12 +664,10 @@ export class BridgeController {
     if (state.bound.status !== "online") return;
     if (state.bound.sessionID !== sessionID) return;
     if (userMessageID.startsWith("tg-")) return;
+    if (state.activePrompt) return;
 
     try {
-      await this.client.session.abort({ sessionID });
-    } catch {}
-    try {
-      await this.client.session.deleteMessage({ sessionID, messageID: userMessageID });
+      await this.client.session.abort({ path: { id: sessionID } });
     } catch {}
     this.api.ui.toast({
       variant: "warning",
@@ -688,7 +731,7 @@ export class BridgeController {
       );
       return;
     }
-    await replyPermission(this.client, requestID, action);
+    await replyPermission(this.client, pending.sessionID, requestID, action);
     const { [requestID]: _removed, ...rest } = state.pendingPermissions;
     await this.persist({
       ...state,
@@ -787,10 +830,10 @@ export class BridgeController {
 
   private async fetchAvailableModels(): Promise<AvailableModel[]> {
     try {
-      const response = await this.client.config.providers(
-        {},
-        { responseStyle: "data", throwOnError: true },
-      );
+      const response = await this.client.config.providers({
+        responseStyle: "data",
+        throwOnError: true,
+      });
       const providers = (response as any)?.providers as Array<{
         id?: string;
         models?: Record<string, { id?: string; name?: string }>;
@@ -824,8 +867,9 @@ export class BridgeController {
     sessionID: string,
     assistantMessageID: string,
     userMessageID: string,
+    directParts?: ReadonlyArray<{ type: string; [key: string]: unknown }>,
   ): Promise<SummaryPayload> {
-    const parts = this.api.state.part(assistantMessageID);
+    const parts = directParts ?? this.api.state.part(assistantMessageID);
     const text = parts
       .filter((part): part is { type: "text"; text: string } => {
         return part.type === "text" && typeof part.text === "string";
@@ -836,14 +880,15 @@ export class BridgeController {
 
     let changedFiles: string[] = [];
     try {
-      const diffResponse = await this.client.session.diff(
-        {
-          sessionID,
+      const diffResponse = await this.client.session.message({
+        path: {
+          id: sessionID,
           messageID: userMessageID,
         },
-        { responseStyle: "data", throwOnError: true },
-      );
-      const diff = (diffResponse as any).diff as Array<{ file: string }> | undefined;
+        responseStyle: "data",
+        throwOnError: true,
+      });
+      const diff = (diffResponse as any)?.diff as Array<{ file: string }> | undefined;
       changedFiles = (diff || []).map((item) => item.file);
     } catch {
       changedFiles = [];
@@ -1036,10 +1081,11 @@ export class BridgeController {
       return;
     }
     try {
-      await this.client.session.summarize(
-        { sessionID: state.bound.sessionID },
-        { responseStyle: "data", throwOnError: true },
-      );
+      await this.client.session.summarize({
+        path: { id: state.bound.sessionID },
+        responseStyle: "data",
+        throwOnError: true,
+      });
       await this.telegram.sendMessage(
         this.config.channelID,
         `Compaction requested for session ${state.bound.sessionID}.`,
@@ -1065,11 +1111,11 @@ export class BridgeController {
       return;
     }
     try {
-      const response = await this.client.session.create(
-        {},
-        { responseStyle: "data", throwOnError: true },
-      );
-      const nextSessionID = (response as any)?.session?.id ?? (response as any)?.id;
+      const response = await this.client.session.create({
+        responseStyle: "data",
+        throwOnError: true,
+      });
+      const nextSessionID = (response as any)?.id ?? (response as any)?.session?.id;
       if (!nextSessionID || typeof nextSessionID !== "string") {
         throw new Error("Could not resolve new session id.");
       }
@@ -1232,7 +1278,7 @@ export class BridgeController {
     }
 
     try {
-      await this.client.session.abort({ sessionID: state.bound.sessionID });
+      await this.client.session.abort({ path: { id: state.bound.sessionID } });
       const latest = await this.requireState();
       if (latest.activePrompt?.userMessageID === state.activePrompt.userMessageID) {
         await this.persist(
@@ -1333,11 +1379,12 @@ export class BridgeController {
   private async getSessionTitle(sessionID: string | undefined): Promise<string | undefined> {
     if (!sessionID) return undefined;
     try {
-      const response = await this.client.session.get(
-        { sessionID },
-        { responseStyle: "data", throwOnError: true },
-      );
-      const title = (response as any)?.session?.title;
+      const response = await this.client.session.get({
+        path: { id: sessionID },
+        responseStyle: "data",
+        throwOnError: true,
+      });
+      const title = (response as any)?.title ?? (response as any)?.session?.title;
       if (typeof title === "string" && title.trim().length > 0) return title.trim();
       return undefined;
     } catch {
@@ -1347,19 +1394,13 @@ export class BridgeController {
 
   private async switchBoundSession(sessionID: string): Promise<void> {
     const state = await this.syncState();
-
-    const next = {
-      ...state,
-      bound: {
-        ...state.bound,
-        sessionID,
-        status: "online" as const,
-      },
-      activePrompt: undefined,
-      promptQueue: [],
-      pendingPermissions: {},
-    };
+    const next = this.resetBoundSessionState(
+      state,
+      sessionID,
+      state.bound.channelID || this.requireChannelID(),
+    );
     await this.persist(next);
+    await this.skipTelegramBacklog();
     await this.startEventStream(sessionID);
   }
 
@@ -1369,7 +1410,9 @@ export class BridgeController {
       try {
         const state = await this.syncState();
         if (!this.lease.isOwner(state)) return;
-        await this.persist(this.lease.refresh(state));
+        const refreshed = this.lease.refresh(state);
+        await this.persist(refreshed);
+        await this.reconcileActivePrompt(refreshed);
       } catch (error) {
         this.api.ui.toast({
           variant: "error",
@@ -1400,6 +1443,12 @@ export class BridgeController {
           const state = await this.syncState();
           if (!this.lease.isOwner(state)) return;
           await this.persist({ ...state, pollingOffset: offset });
+        },
+        onUpdates: (count) => {
+          this.api.ui.toast({
+            variant: "info",
+            message: `Teleprompt: received ${count} Telegram updates`,
+          });
         },
         onError: (error) => {
           this.api.ui.toast({
@@ -1465,6 +1514,18 @@ export class BridgeController {
     return this.normalizeLocalCommand(command).split(/\s+/).filter(Boolean);
   }
 
+  private isLocalCommand(parts: string[], verb: string): boolean {
+    if (parts.length === 0) return false;
+    const head = parts[0]?.toLowerCase();
+    if (!head) return false;
+    return (
+      head === `tp:${verb}` ||
+      head === `tp.${verb}` ||
+      head === `tp-${verb}` ||
+      (head === "tp" && parts[1]?.toLowerCase() === verb)
+    );
+  }
+
   private parseCredentialArgs(parts: string[]): SessionCredentials | undefined {
     if (parts.length < 3) return undefined;
     const botToken = parts[1]?.trim();
@@ -1475,14 +1536,29 @@ export class BridgeController {
 
   private parseStartWithCredentials(command: string): SessionCredentials | undefined {
     const parts = this.splitCommandArgs(command);
-    if (parts[0] !== "tp:start") return undefined;
+    if (!this.isLocalCommand(parts, "start")) return undefined;
+    if (parts[0]?.toLowerCase() === "tp" && parts[1]?.toLowerCase() === "start") {
+      return this.parseCredentialArgs([parts[0], ...parts.slice(2)]);
+    }
     return this.parseCredentialArgs(parts);
   }
 
   private parseCredentialCommand(command: string): SessionCredentials | undefined {
     const parts = this.splitCommandArgs(command);
-    if (parts[0] !== "tp:credentials") return undefined;
+    if (!this.isLocalCommand(parts, "credentials")) return undefined;
+    if (parts[0]?.toLowerCase() === "tp" && parts[1]?.toLowerCase() === "credentials") {
+      return this.parseCredentialArgs([parts[0], ...parts.slice(2)]);
+    }
     return this.parseCredentialArgs(parts);
+  }
+
+  private isVersionCommand(command: string): boolean {
+    const parts = this.splitCommandArgs(command);
+    return this.isLocalCommand(parts, "version");
+  }
+
+  private versionLine(): string {
+    return `opencode-plugin-teleprompt ${PLUGIN_VERSION}`;
   }
 
   private resolveCredentials(credentials?: SessionCredentials): SessionCredentials {
@@ -1546,9 +1622,182 @@ export class BridgeController {
     await this.store.save(next);
   }
 
-  private async syncState(): Promise<BridgeStoreData> {
+  async syncState(): Promise<BridgeStoreData> {
     const latest = await this.store.load();
     this.data = latest;
     return latest;
+  }
+
+  private resetBoundSessionState(
+    state: BridgeStoreData,
+    sessionID: string,
+    channelID: string,
+  ): BridgeStoreData {
+    return {
+      ...state,
+      bound: {
+        sessionID,
+        channelID,
+        status: "online",
+        model: undefined,
+      },
+      activePrompt: undefined,
+      promptQueue: [],
+      pendingPermissions: {},
+      promptHistory: [],
+      recentPrompts: [],
+    };
+  }
+
+  private async skipTelegramBacklog(): Promise<void> {
+    const latestOffset = await this.getTelegramApi().getLatestUpdateOffset();
+    if (latestOffset === undefined) return;
+    const state = await this.requireState();
+    if (latestOffset <= state.pollingOffset) return;
+    await this.persist({
+      ...state,
+      pollingOffset: latestOffset,
+    });
+  }
+
+  private async reconcileActivePrompt(state: BridgeStoreData): Promise<void> {
+    if (this.activePromptCheckInFlight) return;
+    if (!state.activePrompt) return;
+    if (state.bound.status !== "online" || !state.bound.sessionID) return;
+
+    this.activePromptCheckInFlight = true;
+    try {
+      const response = await this.client.session.messages({
+        path: {
+          id: state.bound.sessionID,
+        },
+        responseStyle: "data",
+        throwOnError: true,
+      });
+      const messages = Array.isArray(response) ? response : (response?.messages || response?.items || response?.data || []);
+      const threshold = (state.activePrompt.startedAt ?? state.activePrompt.createdAt) - 1_000;
+      const latestCompletedAssistant = [...messages]
+        .reverse()
+        .find((entry: any) => {
+          const info = entry?.info;
+          return (
+            info?.role === "assistant"
+            && typeof info?.id === "string"
+            && typeof info?.time?.completed === "number"
+            && info.time.completed >= threshold
+          );
+        });
+      if (!latestCompletedAssistant) return;
+
+      await this.completeActivePrompt(
+        state.bound.sessionID,
+        latestCompletedAssistant.info.id,
+        state.activePrompt.userMessageID,
+        latestCompletedAssistant.parts,
+      );
+    } catch {}
+    finally {
+      this.activePromptCheckInFlight = false;
+    }
+  }
+
+  private async clearTuiPrompt(): Promise<void> {
+    try {
+      await this.client.tui.clearPrompt({
+        responseStyle: "data",
+        throwOnError: true,
+      });
+    } catch {}
+  }
+
+  private async waitForPromptCompletion(
+    sessionID: string,
+    userMessageID: string,
+    assistantMessageID?: string,
+  ): Promise<void> {
+    const startedAt = this.deps.now();
+    const timeoutMs = 10 * 60 * 1000;
+    const pollEveryMs = 2000;
+
+    while (this.deps.now() - startedAt < timeoutMs) {
+      const state = await this.syncState();
+      if (!this.lease.isOwner(state)) return;
+      if (state.bound.sessionID !== sessionID) return;
+      if (!state.activePrompt || state.activePrompt.userMessageID !== userMessageID) return;
+
+      try {
+        const response = await this.client.session.messages({
+          path: {
+            id: sessionID,
+          },
+          responseStyle: "data",
+          throwOnError: true,
+        });
+        const messages = Array.isArray(response) ? response : (response?.messages || response?.items || response?.data || []);
+        const completedAssistant = [...messages]
+          .reverse()
+          .find((entry: any) => {
+            const info = entry?.info;
+            if (info?.role !== "assistant") return false;
+            if (assistantMessageID && info.id !== assistantMessageID) return false;
+            if (info?.error) return true;
+            
+            const isCompleted = typeof info?.time?.completed === "number";
+            if (!isCompleted) return false;
+
+            // If we don't have a specific ID, ensure this message wasn't created before we started
+            if (!assistantMessageID) {
+              const created = info?.time?.created || 0;
+              if (created > 0 && created < startedAt - 5000) return false; // 5s buffer
+            }
+            
+            return true;
+          });
+        if (completedAssistant?.info?.id) {
+          if (completedAssistant.info.error) {
+            throw new Error(`Assistant error: ${JSON.stringify(completedAssistant.info.error)}`);
+          }
+          await this.completeActivePrompt(
+            sessionID,
+            completedAssistant.info.id,
+            userMessageID,
+            completedAssistant.parts,
+          );
+          return;
+        }
+      } catch (err) {
+        if (err instanceof Error && err.message.startsWith("Assistant error:")) {
+          throw err;
+        }
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, pollEveryMs));
+    }
+
+    const state = await this.syncState();
+    if (!this.lease.isOwner(state)) return;
+    if (state.bound.sessionID !== sessionID) return;
+    if (state.activePrompt?.userMessageID !== userMessageID) return;
+    await this.telegram.sendMessage(
+      this.config.channelID,
+      "failed: prompt timed out waiting for completion",
+      { replyToMessageID: state.activePrompt.telegramMessageID },
+    );
+    await this.persist(
+      this.appendPromptHistory(
+        {
+          ...state,
+          activePrompt: undefined,
+        },
+        {
+          jobID: userMessageID,
+          prompt: state.activePrompt.prompt,
+          summary: "Timed out waiting for assistant completion.",
+          changedFiles: [],
+          status: "failed",
+          at: this.deps.now(),
+        },
+      ),
+    );
   }
 }

@@ -11,13 +11,33 @@ export async function submitPrompt(
     providerID: string;
     modelID: string;
   },
-): Promise<{ userMessageID: string }> {
+): Promise<{
+  userMessageID: string;
+  assistantMessageID?: string;
+  assistantParts?: ReadonlyArray<{ type: string; [key: string]: unknown }>;
+}> {
   const userMessageID = createTelegramUserMessageID(updateID);
-  await client.session.promptAsync({
-    sessionID,
-    messageID: userMessageID,
-    ...(model ? { model } : {}),
-    parts: [{ type: "text", text: prompt }],
+  const response = await client.session.prompt({
+    path: {
+      id: sessionID,
+    },
+    body: {
+      messageID: userMessageID,
+      ...(model ? { model } : {}),
+      parts: [{ type: "text", text: prompt }],
+    },
+    responseStyle: "data",
+    throwOnError: true,
   });
-  return { userMessageID };
+
+  const info = (response?.info || response?.data?.info) as { id?: string } | undefined;
+  const parts = (response?.parts || response?.data?.parts) as
+    | ReadonlyArray<{ type: string; [key: string]: unknown }>
+    | undefined;
+
+  return {
+    userMessageID,
+    assistantMessageID: typeof info?.id === "string" ? info.id : undefined,
+    assistantParts: parts,
+  };
 }

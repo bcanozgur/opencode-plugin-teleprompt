@@ -48,6 +48,9 @@ function parseCommandBody(body: string): TelegramCommand | undefined {
   const lastErrorMatch = /^last-error\s*$/i.exec(trimmed);
   if (lastErrorMatch) return { kind: "last-error" };
 
+  const versionMatch = /^version\s*$/i.exec(trimmed);
+  if (versionMatch) return { kind: "version" };
+
   const cancelMatch = /^cancel\s+([A-Za-z0-9_\-:.]+)\s*$/i.exec(trimmed);
   if (cancelMatch) return { kind: "cancel", target: cancelMatch[1] };
 
@@ -76,7 +79,7 @@ export function parseTelegramUpdate(
   channelID: string,
   prefix: string,
 ): ParsedTelegramCommand | undefined {
-  const post = update.channel_post;
+  const post = update.channel_post || update.message;
   if (!post) return undefined;
 
   const normalizedChannel = String(post.chat.id);
@@ -216,6 +219,16 @@ export function parseTelegramUpdate(
         channelID: normalizedChannel,
         rawText: text,
         command: { kind: "last-error" },
+      };
+    }
+
+    if (/^version\s*$/i.test(colonBody)) {
+      return {
+        updateID: update.update_id,
+        messageID: post.message_id,
+        channelID: normalizedChannel,
+        rawText: text,
+        command: { kind: "version" },
       };
     }
 

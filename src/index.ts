@@ -1,4 +1,9 @@
 import { tui } from "./tui.js";
+import type { Plugin } from "@opencode-ai/plugin";
 
-export default { tui };
-export { tui };
+const id = "opencode-plugin-teleprompt";
+
+const server: Plugin = async () => ({});
+
+export default { id, server };
+export { id, server, tui };

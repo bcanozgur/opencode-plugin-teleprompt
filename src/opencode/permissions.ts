@@ -78,11 +78,19 @@ function classifyRisk(
 
 export async function replyPermission(
   client: any,
+  sessionID: string,
   requestID: string,
   action: "once" | "always" | "reject",
 ): Promise<void> {
-  await client.permission.reply({
-    requestID,
-    reply: action,
+  await client.postSessionByIdPermissionsByPermissionId({
+    path: {
+      id: sessionID,
+      permissionID: requestID,
+    },
+    body: {
+      response: action === "once" ? "once" : action === "always" ? "always" : "reject",
+    },
+    responseStyle: "data",
+    throwOnError: true,
   });
 }
