@@ -4,11 +4,12 @@ TUI-scoped OpenCode plugin that binds a Telegram channel to one active OpenCode 
 
 ## What It Does
 
-- Polls a strict Telegram channel for `/tp` commands
-- Injects `/tp <prompt>` into the currently bound OpenCode session
-- Sends summary-only response messages back to the same channel
-- Relays OpenCode permission prompts and accepts Telegram `approve`, `approve-always`, `deny`
-- Keeps single-owner bridge semantics across multiple OpenCode consoles
+- **Frictionless Chat Interface**: Type direct prompts (like `write a python function`) in your Telegram channel without any prefixes!
+- **Direct Slash Commands**: Run administrative commands like `/status`, `/queue`, `/dc` or `/approve <id>` directly in the Telegram channel.
+- **Backward Compatibility**: Fully supports old `/tp <prompt>` and `/tp:<command>` syntax out of the box.
+- **Relays Permission Prompts**: Directly relays OpenCode permission requests and accepts direct `/approve`, `/approve-always`, and `/deny` replies.
+- **Lease-based Owner Semantics**: Keeps single-owner bridge semantics across multiple OpenCode consoles.
+- **Instant Ctrl+C Exit**: Stops event streams and cleans up instantly, ensuring no exit lags when shutting down OpenCode.
 
 ## V1 Limits
 
@@ -67,33 +68,33 @@ OpenCode installs npm plugins automatically at startup.
 5. While teleprompt is active, local prompt input is locked for that session.
 6. Disconnect options:
    - Press `Esc` twice in a row in OpenCode
-   - Send `/tp:dc` in Telegram channel
+   - Send `/dc` in Telegram channel
    - Run `/tp:stop` in OpenCode
 7. Use Telegram channel commands:
-   - `/tp <prompt>`
-   - `/tp:interrupt`
-   - `/tp:queue`
-   - `/tp:cancel <job_id|last>`
-   - `/tp:retry`
-   - `/tp:context`
-   - `/tp:compact`
-   - `/tp:newsession`
-   - `/tp:reset-context`
-   - `/tp:who`
-   - `/tp:health`
-   - `/tp:reclaim`
-   - `/tp:history`
-   - `/tp:last-error`
-   - `/tp:model`
-   - `/tp:model fast`
-   - `/tp:model smart`
-   - `/tp:model max`
-   - `/tp:model <provider>/<model>`
-   - `/tp approve <request_id>`
-   - `/tp approve-always <request_id>`
-   - `/tp deny <request_id>`
-   - `/tp status`
-   - `/tp:dc`
+   - `<prompt>` (any message NOT starting with `/` is treated directly as a prompt!)
+   - `/interrupt` (or `/tp:interrupt`)
+   - `/queue` (or `/tp:queue`)
+   - `/cancel <job_id|last>` (or `/tp:cancel <job_id|last>`)
+   - `/retry` (or `/tp:retry`)
+   - `/context` (or `/tp:context`)
+   - `/compact` (or `/tp:compact`)
+   - `/newsession` (or `/tp:newsession`)
+   - `/reset-context` (or `/tp:reset-context`)
+   - `/who` (or `/tp:who`)
+   - `/health` (or `/tp:health`)
+   - `/reclaim` (or `/tp:reclaim`)
+   - `/history` (or `/tp:history`)
+   - `/last-error` (or `/tp:last-error`)
+   - `/model` (or `/tp:model`)
+   - `/model fast` (or `/tp:model fast`)
+   - `/model smart` (or `/tp:model smart`)
+   - `/model max` (or `/tp:model max`)
+   - `/model <provider>/<model>`
+   - `/approve <request_id>`
+   - `/approve-always <request_id>`
+   - `/deny <request_id>`
+   - `/status`
+   - `/dc` (or `/tp:dc`)
 
 During remote runs, teleprompt posts lifecycle updates (`accepted`, `queued`, `running`, `waiting-permission`, `completed`, `failed`) and result summaries are sent as replies to the originating Telegram message for clear correlation.
 
@@ -119,23 +120,23 @@ During remote runs, teleprompt posts lifecycle updates (`accepted`, `queued`, `r
    - `OPENCODE_TELEGRAM_CHANNEL_ID`
 3. Start OpenCode and ensure plugin loads without startup errors.
 4. Open one session, run `/tp:start`, verify bridge binds.
-5. Send `/tp status` from Telegram and confirm status response.
-6. Send `/tp test ping` and confirm lifecycle + summary reply.
-7. Send `/tp:dc` and confirm local input is unlocked in OpenCode.
+5. Send `/status` from Telegram and confirm status response.
+6. Send `test ping` and confirm lifecycle + summary reply.
+7. Send `/dc` and confirm local input is unlocked in OpenCode.
 
 ## Telegram Live E2E Quick Checklist
 
 1. Start OpenCode session and run `/tp:start`.
-2. From Telegram channel, run `/tp status` and verify owner/session info.
-3. Run `/tp:model` and switch once with `/tp:model fast` (or explicit provider/model).
-4. Send `/tp write a 1-line summary of this session` and verify:
+2. From Telegram channel, run `/status` and verify owner/session info.
+3. Run `/model` and switch once with `/model fast` (or explicit provider/model).
+4. Send `write a 1-line summary of this session` and verify:
    - `accepted` -> `running` -> `completed`
    - summary arrives as reply to the same Telegram message
 5. Trigger a permissioned action prompt and verify:
    - plugin posts permission request with `request_id`
-   - `/tp approve <request_id>` (or `/tp deny <request_id>`) is applied immediately
-6. Send `/tp:interrupt` during a long run and confirm graceful stop.
-7. Send `/tp:dc` and confirm disconnect/unlock behavior.
+   - `/approve <request_id>` (or `/deny <request_id>`) is applied immediately
+6. Send `/interrupt` during a long run and confirm graceful stop.
+7. Send `/dc` and confirm disconnect/unlock behavior.
 
 ## Command Reference
 
@@ -149,32 +150,32 @@ During remote runs, teleprompt posts lifecycle updates (`accepted`, `queued`, `r
 
 ### Telegram Commands
 
-- `/tp <prompt>`: Queue a new prompt for the currently bound session.
-- `/tp:interrupt`: Abort the currently running remote prompt without disconnecting the bridge.
-- `/tp:queue`: Show active prompt and queued prompts.
-- `/tp:cancel <job_id|last>`: Remove a queued prompt by job ID, or remove the newest queued prompt with `last`.
-- `/tp:retry`: Re-queue the most recent prompt from prompt history.
-- `/tp:context`: Show compact session context (recent prompts, summaries, and changed files).
-- `/tp:compact`: Trigger session summarization/compaction for long-running sessions.
-- `/tp:newsession`: Create a new OpenCode session and switch teleprompt binding to it.
-- `/tp:reset-context`: Alias behavior for creating/switching to a fresh session context.
-- `/tp:who`: Show lease ownership details (current instance, lease owner, ownership state).
-- `/tp:health`: Show bridge health (lease age/staleness, poller/event stream status, queue stats).
-- `/tp:reclaim`: Try to reclaim bridge ownership for the current instance.
-- `/tp:history`: Show recent run history with status and short summaries.
-- `/tp:last-error`: Show the latest failed or interrupted run summary.
-- `/tp:model`: List available models by provider and show current model selection.
-- `/tp:model fast`: Select a model using the `fast` preset resolver.
-- `/tp:model smart`: Select a model using the `smart` preset resolver.
-- `/tp:model max`: Select a model using the `max` preset resolver.
-- `/tp:model <provider>/<model>`: Select an explicit provider/model for the bound session.
-- `/tp approve <request_id>`: Approve a pending permission request once.
-- `/tp approve-always <request_id>`: Approve a pending permission request and persist approval behavior when supported.
-- `/tp deny <request_id>`: Reject a pending permission request.
-- `/tp status`: Show bridge status from Telegram.
-- `/tp:dc`: Disconnect teleprompt from Telegram and unbind the current session.
+- `<prompt>`: Any message not starting with `/` is queued directly as a prompt for the session.
+- `/interrupt`: Abort the currently running remote prompt without disconnecting the bridge.
+- `/queue`: Show active prompt and queued prompts.
+- `/cancel <job_id|last>`: Remove a queued prompt by job ID, or remove the newest queued prompt with `last`.
+- `/retry`: Re-queue the most recent prompt from prompt history.
+- `/context`: Show compact session context (recent prompts, summaries, and changed files).
+- `/compact`: Trigger session summarization/compaction for long-running sessions.
+- `/newsession`: Create a new OpenCode session and switch teleprompt binding to it.
+- `/reset-context`: Alias behavior for creating/switching to a fresh session context.
+- `/who`: Show lease ownership details (current instance, lease owner, ownership state).
+- `/health`: Show bridge health (lease age/staleness, poller/event stream status, queue stats).
+- `/reclaim`: Try to reclaim bridge ownership for the current instance.
+- `/history`: Show recent run history with status and short summaries.
+- `/last-error`: Show the latest failed or interrupted run summary.
+- `/model`: List available models by provider and show current model selection.
+- `/model fast`: Select a model using the `fast` preset resolver.
+- `/model smart`: Select a model using the `smart` preset resolver.
+- `/model max`: Select a model using the `max` preset resolver.
+- `/model <provider>/<model>`: Select an explicit provider/model for the bound session.
+- `/approve <request_id>`: Approve a pending permission request once.
+- `/approve-always <request_id>`: Approve a pending permission request and persist approval behavior when supported.
+- `/deny <request_id>`: Reject a pending permission request.
+- `/status`: Show bridge status from Telegram.
+- `/dc`: Disconnect teleprompt from Telegram and unbind the current session.
 
 ## Shutdown Behavior
 
-- On normal TUI disposal (`Ctrl+C`, clean exit), poller and heartbeat stop and lease is released.
+- On normal TUI disposal (`Ctrl+C`, clean exit), poller and heartbeat stop and lease is released **instantly** without hangs.
 - On unclean termination, lease expires by TTL and next owner instance can reclaim.
