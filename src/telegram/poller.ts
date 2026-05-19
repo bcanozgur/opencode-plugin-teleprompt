@@ -1,6 +1,8 @@
 import type { ParsedTelegramCommand, TelegramUpdate } from "../types.js";
 import { parseTelegramUpdate } from "./parser.js";
 import { TelegramApi } from "./api.js";
+import { delayWithSignal } from "./delay.js";
+
 
 type PollerHandlers = {
   onCommand: (command: ParsedTelegramCommand) => Promise<void>;
@@ -31,8 +33,9 @@ export class TelegramPoller {
       } catch (error) {
         if (signal.aborted) break;
         this.handlers.onError(error);
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+        await delayWithSignal(1000, signal);
       }
+
     }
   }
 
@@ -45,6 +48,19 @@ export class TelegramPoller {
       const parsed = parseTelegramUpdate(update, this.channelID, this.prefix);
       const candidateOffset = Math.max(nextOffset, update.update_id + 1);
       if (!parsed) {
+        const post = update.channel_post || update.message;
+        if (post) {
+          const chatId = post.chat.id;
+          const text = post.text || "";
+          // Only show warning if it looks like a command meant for the bot
+          if (text.trim().startsWith(this.prefix) || text.trim().startsWith("/")) {
+            this.handlers.onError(
+              new Error(
+                `Update ignored. Got Chat ID: ${chatId} (expected: ${this.channelID}), Text: "${text}"`,
+              ),
+            );
+          }
+        }
         nextOffset = candidateOffset;
         await this.handlers.onOffset(nextOffset);
         continue;

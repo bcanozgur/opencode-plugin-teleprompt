@@ -51,6 +51,9 @@ function parseCommandBody(body: string): TelegramCommand | undefined {
   const versionMatch = /^version\s*$/i.exec(trimmed);
   if (versionMatch) return { kind: "version" };
 
+  const dcMatch = /^(dc|disconnect)\s*$/i.exec(trimmed);
+  if (dcMatch) return { kind: "disconnect" };
+
   const cancelMatch = /^cancel\s+([A-Za-z0-9_\-:.]+)\s*$/i.exec(trimmed);
   if (cancelMatch) return { kind: "cancel", target: cancelMatch[1] };
 
@@ -71,6 +74,29 @@ function parseCommandBody(body: string): TelegramCommand | undefined {
   if (denyMatch) {
     return { kind: "permission", action: "reject", requestID: denyMatch[1] };
   }
+
+  const modelMatch = /^model(?:\s+([A-Za-z0-9_./-]+))?\s*$/i.exec(trimmed);
+  if (modelMatch) {
+    const rawTarget = modelMatch[1]?.trim();
+    if (!rawTarget) {
+      return { kind: "model" };
+    }
+    const preset = rawTarget.toLowerCase();
+    if (preset === "fast" || preset === "smart" || preset === "max") {
+      return { kind: "model", preset };
+    }
+    const providerModel = /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.:-]+)$/.exec(rawTarget);
+    if (providerModel) {
+      return {
+        kind: "model",
+        target: {
+          providerID: providerModel[1],
+          modelID: providerModel[2],
+        },
+      };
+    }
+  }
+
   return { kind: "prompt", prompt: trimmed };
 }
 
@@ -88,218 +114,67 @@ export function parseTelegramUpdate(
   const text = post.text?.trim();
   if (!text) return undefined;
 
+  // 1. Direct Prompts (Non-slash messages)
+  if (!text.startsWith("/")) {
+    return {
+      updateID: update.update_id,
+      messageID: post.message_id,
+      channelID: normalizedChannel,
+      rawText: text,
+      command: { kind: "prompt", prompt: text },
+    };
+  }
+
+  // 2. Backward compatibility: Handle "/tp:" commands
   if (text.startsWith(`${prefix}:`)) {
-    const colonBody = text.slice(`${prefix}:`.length).trim();
-    if (!colonBody) return undefined;
+    const remainder = text.slice(`${prefix}:`.length).trim();
+    const command = parseCommandBody(remainder);
+    if (!command) return undefined;
+    return {
+      updateID: update.update_id,
+      messageID: post.message_id,
+      channelID: normalizedChannel,
+      rawText: text,
+      command,
+    };
+  }
 
-    if (/^dc\s*$/i.test(colonBody)) {
-      return {
-        updateID: update.update_id,
-        messageID: post.message_id,
-        channelID: normalizedChannel,
-        rawText: text,
-        command: { kind: "disconnect" },
-      };
-    }
+  // 3. Backward compatibility: Handle "/tp " commands/prompts
+  if (text.startsWith(`${prefix} `)) {
+    const remainder = text.slice(`${prefix} `.length).trim();
+    const command = parseCommandBody(remainder);
+    if (!command) return undefined;
+    return {
+      updateID: update.update_id,
+      messageID: post.message_id,
+      channelID: normalizedChannel,
+      rawText: text,
+      command,
+    };
+  }
 
-    if (/^interrupt\s*$/i.test(colonBody)) {
-      return {
-        updateID: update.update_id,
-        messageID: post.message_id,
-        channelID: normalizedChannel,
-        rawText: text,
-        command: { kind: "interrupt" },
-      };
-    }
-
-    if (/^queue\s*$/i.test(colonBody)) {
-      return {
-        updateID: update.update_id,
-        messageID: post.message_id,
-        channelID: normalizedChannel,
-        rawText: text,
-        command: { kind: "queue" },
-      };
-    }
-
-    if (/^retry\s*$/i.test(colonBody)) {
-      return {
-        updateID: update.update_id,
-        messageID: post.message_id,
-        channelID: normalizedChannel,
-        rawText: text,
-        command: { kind: "retry" },
-      };
-    }
-
-    if (/^context\s*$/i.test(colonBody)) {
-      return {
-        updateID: update.update_id,
-        messageID: post.message_id,
-        channelID: normalizedChannel,
-        rawText: text,
-        command: { kind: "context" },
-      };
-    }
-
-    if (/^compact\s*$/i.test(colonBody)) {
-      return {
-        updateID: update.update_id,
-        messageID: post.message_id,
-        channelID: normalizedChannel,
-        rawText: text,
-        command: { kind: "compact" },
-      };
-    }
-
-    if (/^(newsession|new-session)\s*$/i.test(colonBody)) {
-      return {
-        updateID: update.update_id,
-        messageID: post.message_id,
-        channelID: normalizedChannel,
-        rawText: text,
-        command: { kind: "newsession" },
-      };
-    }
-
-    if (/^reset-context\s*$/i.test(colonBody)) {
-      return {
-        updateID: update.update_id,
-        messageID: post.message_id,
-        channelID: normalizedChannel,
-        rawText: text,
-        command: { kind: "reset-context" },
-      };
-    }
-
-    if (/^who\s*$/i.test(colonBody)) {
-      return {
-        updateID: update.update_id,
-        messageID: post.message_id,
-        channelID: normalizedChannel,
-        rawText: text,
-        command: { kind: "who" },
-      };
-    }
-
-    if (/^health\s*$/i.test(colonBody)) {
-      return {
-        updateID: update.update_id,
-        messageID: post.message_id,
-        channelID: normalizedChannel,
-        rawText: text,
-        command: { kind: "health" },
-      };
-    }
-
-    if (/^reclaim\s*$/i.test(colonBody)) {
-      return {
-        updateID: update.update_id,
-        messageID: post.message_id,
-        channelID: normalizedChannel,
-        rawText: text,
-        command: { kind: "reclaim" },
-      };
-    }
-
-    if (/^history\s*$/i.test(colonBody)) {
-      return {
-        updateID: update.update_id,
-        messageID: post.message_id,
-        channelID: normalizedChannel,
-        rawText: text,
-        command: { kind: "history" },
-      };
-    }
-
-    if (/^last-error\s*$/i.test(colonBody)) {
-      return {
-        updateID: update.update_id,
-        messageID: post.message_id,
-        channelID: normalizedChannel,
-        rawText: text,
-        command: { kind: "last-error" },
-      };
-    }
-
-    if (/^version\s*$/i.test(colonBody)) {
-      return {
-        updateID: update.update_id,
-        messageID: post.message_id,
-        channelID: normalizedChannel,
-        rawText: text,
-        command: { kind: "version" },
-      };
-    }
-
-    const cancelMatch = /^cancel\s+([A-Za-z0-9_\-:.]+)\s*$/i.exec(colonBody);
-    if (cancelMatch) {
-      return {
-        updateID: update.update_id,
-        messageID: post.message_id,
-        channelID: normalizedChannel,
-        rawText: text,
-        command: { kind: "cancel", target: cancelMatch[1] },
-      };
-    }
-
-    const modelMatch = /^model(?:\s+([A-Za-z0-9_./-]+))?\s*$/i.exec(colonBody);
-    if (modelMatch) {
-      const rawTarget = modelMatch[1]?.trim();
-      if (!rawTarget) {
-        return {
-          updateID: update.update_id,
-          messageID: post.message_id,
-          channelID: normalizedChannel,
-          rawText: text,
-          command: { kind: "model" },
-        };
-      }
-      const preset = rawTarget.toLowerCase();
-      if (preset === "fast" || preset === "smart" || preset === "max") {
-        return {
-          updateID: update.update_id,
-          messageID: post.message_id,
-          channelID: normalizedChannel,
-          rawText: text,
-          command: { kind: "model", preset },
-        };
-      }
-      const providerModel = /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.:-]+)$/.exec(rawTarget);
-      if (providerModel) {
-        return {
-          updateID: update.update_id,
-          messageID: post.message_id,
-          channelID: normalizedChannel,
-          rawText: text,
-          command: {
-            kind: "model",
-            target: {
-              providerID: providerModel[1],
-              modelID: providerModel[2],
-            },
-          },
-        };
-      }
-      return undefined;
-    }
-
+  // 4. Handle exact "/tp"
+  if (text === prefix) {
     return undefined;
   }
 
-  if (!text.startsWith(prefix)) return undefined;
+  // 5. Handle direct slash commands, e.g., "/status", "/approve <id>"
+  if (text.startsWith("/")) {
+    const remainder = text.slice(1).trim();
+    const command = parseCommandBody(remainder);
+    // Only accept if it is a real command and NOT fallback prompt
+    if (command && command.kind !== "prompt") {
+      return {
+        updateID: update.update_id,
+        messageID: post.message_id,
+        channelID: normalizedChannel,
+        rawText: text,
+        command,
+      };
+    }
+  }
 
-  const remainder = text.slice(prefix.length).trim();
-  const command = parseCommandBody(remainder);
-  if (!command) return undefined;
-
-  return {
-    updateID: update.update_id,
-    messageID: post.message_id,
-    channelID: normalizedChannel,
-    rawText: text,
-    command,
-  };
+  return undefined;
 }
 
 export function isChannelPostFromTarget(
@@ -309,3 +184,4 @@ export function isChannelPostFromTarget(
   if (!post) return false;
   return String(post.chat.id) === channelID;
 }
+

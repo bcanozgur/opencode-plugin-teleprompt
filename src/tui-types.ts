@@ -32,6 +32,19 @@ export type TuiPluginApi = {
       variant?: "info" | "success" | "warning" | "error";
       message: string;
     }) => void;
+    dialog: {
+      replace: (render: () => any, onClose?: () => void) => void;
+      clear: () => void;
+    };
+    DialogPrompt: (props: {
+      title: string;
+      placeholder?: string;
+      value?: string;
+      busy?: boolean;
+      busyText?: string;
+      onConfirm?: (value: string) => void;
+      onCancel?: () => void;
+    }) => any;
   };
   lifecycle: {
     onDispose: (fn: () => void | Promise<void>) => () => void;

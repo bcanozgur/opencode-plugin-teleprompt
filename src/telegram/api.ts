@@ -1,4 +1,5 @@
 import type { TelegramUpdate } from "../types.js";
+import { delayWithSignal } from "./delay.js";
 
 type TelegramApiResult<T> = {
   ok: boolean;
@@ -96,12 +97,19 @@ export class TelegramApi {
         body: JSON.stringify(body),
         signal,
       });
-      if (!res.ok) {
-        throw new Error(`Telegram API HTTP ${res.status}`);
+      let json: TelegramApiResult<T> | undefined;
+      try {
+        json = (await res.json()) as TelegramApiResult<T>;
+      } catch {
+        // ignore
       }
-      const json = (await res.json()) as TelegramApiResult<T>;
-      if (!json.ok || json.result === undefined) {
-        throw new Error(json.description || "Telegram API request failed");
+
+      if (!res.ok) {
+        const desc = json?.description ? `: ${json.description}` : "";
+        throw new Error(`Telegram API HTTP ${res.status}${desc}`);
+      }
+      if (!json || !json.ok || json.result === undefined) {
+        throw new Error(json?.description || "Telegram API request failed");
       }
       return json.result;
     };
@@ -110,8 +118,9 @@ export class TelegramApi {
       return await run();
     } catch (error) {
       if (signal?.aborted) throw error;
-      await new Promise((resolve) => setTimeout(resolve, 800));
+      await delayWithSignal(800, signal);
       return run();
     }
+
   }
 }

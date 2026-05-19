@@ -8,3 +8,10 @@ opencode.json
 .idea/
 planning/
 AGENTS.md
+start-opencode.sh
+.opencode-telegram-bridge.json*
+*.debug.json
+.opencode/
+test-*
+.DS_Store
+

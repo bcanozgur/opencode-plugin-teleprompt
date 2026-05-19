@@ -5,5 +5,5 @@ const id = "opencode-plugin-teleprompt";
 
 const server: Plugin = async () => ({});
 
-export default { id, server };
+export default { id, server, tui };
 export { id, server, tui };

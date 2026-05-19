@@ -19,6 +19,7 @@ type EventHandlers = {
 export class SessionEventStream {
   private abort = new AbortController();
   private running?: Promise<void>;
+  private stream?: any;
 
   constructor(
     private readonly client: any,
@@ -36,24 +37,36 @@ export class SessionEventStream {
 
   async stop(): Promise<void> {
     this.abort.abort();
+    try {
+      if (this.stream && typeof this.stream.return === "function") {
+        await this.stream.return();
+      }
+    } catch {
+      // ignore
+    }
     await this.running;
     this.running = undefined;
   }
 
   private async loop(): Promise<void> {
-    const streamResult = await this.client.event.subscribe();
+    const streamResult = await this.client.event.subscribe(
+      {},
+      { responseStyle: "stream", throwOnError: true, signal: this.abort.signal },
+    );
+    this.stream = streamResult?.stream;
     try {
-      for await (const event of streamResult.stream as AsyncIterable<any>) {
+      for await (const event of this.stream as AsyncIterable<any>) {
         if (this.abort.signal.aborted) break;
         if (!event || typeof event !== "object") continue;
         await this.handleEvent(event);
       }
-    } catch {
+    } catch (error) {
       if (!this.abort.signal.aborted) {
         throw new Error("Event stream terminated unexpectedly.");
       }
     }
   }
+
 
   private async handleEvent(event: any): Promise<void> {
     if (event.type === "permission.asked") {

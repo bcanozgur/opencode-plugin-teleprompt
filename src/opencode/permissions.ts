@@ -39,10 +39,11 @@ export function formatPermissionRequestMessage(
     patterns,
     "",
     "Reply examples:",
-    `- Approve once: ${prefix} approve ${permission.requestID}`,
-    `- Approve always: ${prefix} approve-always ${permission.requestID}`,
-    `- Deny: ${prefix} deny ${permission.requestID}`,
+    `- Approve once: /approve ${permission.requestID}`,
+    `- Approve always: /approve-always ${permission.requestID}`,
+    `- Deny: /deny ${permission.requestID}`,
   ].join("\n");
+
 }
 
 function classifyRisk(
@@ -82,15 +83,17 @@ export async function replyPermission(
   requestID: string,
   action: "once" | "always" | "reject",
 ): Promise<void> {
-  await client.postSessionByIdPermissionsByPermissionId({
-    path: {
-      id: sessionID,
-      permissionID: requestID,
-    },
-    body: {
-      response: action === "once" ? "once" : action === "always" ? "always" : "reject",
-    },
-    responseStyle: "data",
-    throwOnError: true,
-  });
+  // Bundled SDK convention: (params, options)
+  // Try the bundled method name first, fall back to workspace SDK name
+  const response = action === "once" ? "once" : action === "always" ? "always" : "reject";
+  const fn =
+    client.postSessionSessionIDPermissionsPermissionID ??
+    client.postSessionIdPermissionsPermissionId ??
+    client.postSessionByIdPermissionsByPermissionId;
+  if (fn) {
+    await fn.call(client,
+      { sessionID, permissionID: requestID, response },
+      { responseStyle: "data", throwOnError: true },
+    );
+  }
 }

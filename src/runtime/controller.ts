@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { appendFileSync } from "node:fs";
 import type {
   BridgeConfig,
   BridgeStoreData,
@@ -151,11 +152,12 @@ export class BridgeController {
   private lastEscAt = 0;
   private sessionCredentials?: SessionCredentials;
   private activePromptCheckInFlight = false;
+  private completionInFlight = false;
 
   constructor(
     private readonly api: TuiPluginApi,
     private readonly config: BridgeConfig,
-    storePath: string,
+    private readonly storePath: string,
     deps?: Partial<RuntimeDeps>,
   ) {
     this.deps = { ...DEFAULT_DEPS, ...deps };
@@ -170,6 +172,16 @@ export class BridgeController {
     );
   }
 
+  private log(message: string): void {
+    try {
+      const logPath = this.storePath.replace(/\.json$/, ".log");
+      const timestamp = new Date().toISOString();
+      appendFileSync(logPath, `[${timestamp}] ${message}\n`, "utf8");
+    } catch {
+      // ignore
+    }
+  }
+
   async init(): Promise<void> {
     this.data = await this.store.load();
   }
@@ -182,7 +194,20 @@ export class BridgeController {
     this.config.channelID = resolvedCredentials.channelID;
     this.store.setChannelID(resolvedCredentials.channelID);
 
+    this.log(`bindCurrent: api.route.current = ${JSON.stringify(this.api.route.current)}`);
+    try {
+      const listResponse = await this.client.session.list(
+        { directory: this.api.state.path.directory },
+        { responseStyle: "data", throwOnError: true },
+      );
+      const sessions = Array.isArray(listResponse) ? listResponse : (listResponse?.sessions || listResponse?.items || listResponse?.data || []);
+      this.log(`bindCurrent: available sessions: ${JSON.stringify(sessions.map((s: any) => ({ id: s.id, title: s.title })))}`);
+    } catch (e) {
+      this.log(`bindCurrent: failed to list sessions: ${String(e)}`);
+    }
+
     const sessionID = await getCurrentOrCreateSessionID(this.api, this.client);
+    this.log(`bindCurrent: getCurrentOrCreateSessionID returned ${sessionID}`);
     const state = await this.syncState();
     const claimed = this.lease.claim(state);
     const next = this.resetBoundSessionState(
@@ -260,10 +285,12 @@ export class BridgeController {
   }
 
   async handleTelegramCommand(command: ParsedTelegramCommand): Promise<void> {
+    this.log(`handleTelegramCommand: kind=${command.command.kind}, updateID=${command.updateID}, messageID=${command.messageID}`);
     const state = await this.syncState();
     const isOwner = this.lease.isOwner(state);
     const alwaysAllowed = new Set(["status", "who", "health", "reclaim", "version"]);
     if (!isOwner && !alwaysAllowed.has(command.command.kind)) {
+      this.log(`handleTelegramCommand: rejected because not owner (isOwner=${isOwner}, kind=${command.command.kind})`);
       await this.telegram.sendMessage(
         this.config.channelID,
         "Bridge is currently owned by another OpenCode instance. Use /tp:reclaim first.",
@@ -393,6 +420,7 @@ export class BridgeController {
     }
 
     if (state.bound.status !== "online" || !state.bound.sessionID) {
+      this.log(`handleTelegramCommand: rejected because offline or missing session ID (status=${state.bound.status}, sessionID=${state.bound.sessionID})`);
       await this.telegram.sendMessage(
         this.config.channelID,
         "Bridge is offline. Run /tp:start in OpenCode first.",
@@ -401,6 +429,7 @@ export class BridgeController {
       return;
     }
 
+    this.log(`handleTelegramCommand: accepting prompt, sending accepted to Telegram`);
     await this.telegram.sendMessage(
       this.config.channelID,
       "accepted",
@@ -519,15 +548,32 @@ export class BridgeController {
   }
 
   private async processPromptQueue(): Promise<void> {
-    if (this.processingQueue) return;
+    if (this.processingQueue) {
+      this.log("processPromptQueue: queue processing already in progress");
+      return;
+    }
     this.processingQueue = true;
+    this.log("processPromptQueue: started processing queue");
     try {
       while (true) {
         const state = await this.syncState();
-        if (!this.lease.isOwner(state)) return;
-        if (state.activePrompt || state.promptQueue.length === 0) return;
+        if (!this.lease.isOwner(state)) {
+          this.log(`processPromptQueue: stopped - not owner of lease`);
+          return;
+        }
+        if (state.activePrompt) {
+          this.log(`processPromptQueue: stopped - another prompt is active (activePromptID=${state.activePrompt.userMessageID})`);
+          return;
+        }
+        if (state.promptQueue.length === 0) {
+          this.log(`processPromptQueue: queue is empty`);
+          return;
+        }
         const job = state.promptQueue[0];
-        if (!state.bound.sessionID) return;
+        if (!state.bound.sessionID) {
+          this.log(`processPromptQueue: error - missing sessionID in state`);
+          return;
+        }
         const startedAt = this.deps.now();
         const activeJob: PromptJob = {
           ...job,
@@ -539,29 +585,31 @@ export class BridgeController {
           promptQueue: state.promptQueue.slice(1),
         };
         await this.persist(next);
+        this.log(`processPromptQueue: activeJob set to userMessageID=${activeJob.userMessageID}`);
         this.api.ui.toast({
           variant: "info",
           message: `Teleprompt: sending prompt to session ${state.bound.sessionID}...`,
         });
-        await this.telegram.sendMessage(
-          this.config.channelID,
-          "running",
-          { replyToMessageID: activeJob.telegramMessageID },
-        );
+
         try {
+          this.log(`processPromptQueue: submitting to client: prompt="${job.prompt}"`);
           const submitted = await submitPrompt(
             this.client,
             state.bound.sessionID,
             job.prompt,
             job.telegramUpdateID,
+            this.api.state.path.directory,
             state.bound.model,
           );
+          this.log(`processPromptQueue: submitted successfully. userMessageID=${submitted.userMessageID}, assistantMessageID=${submitted.assistantMessageID}. Waiting for completion...`);
           await this.waitForPromptCompletion(
             state.bound.sessionID,
             submitted.userMessageID,
             submitted.assistantMessageID,
           );
+          this.log(`processPromptQueue: completed successfully`);
         } catch (error) {
+          this.log(`processPromptQueue: execution failed: ${String(error)}`);
           const latest = await this.requireState();
           if (latest.activePrompt?.userMessageID === activeJob.userMessageID) {
             await this.persist(
@@ -590,19 +638,19 @@ export class BridgeController {
       }
     } finally {
       this.processingQueue = false;
+      this.log("processPromptQueue: finished processing queue");
     }
   }
 
   private async onAssistantCompleted(
-    sessionID: string,
-    assistantMessageID: string,
-    parentUserMessageID: string,
+    _sessionID: string,
+    _assistantMessageID: string,
+    _parentUserMessageID: string,
   ): Promise<void> {
-    await this.completeActivePrompt(
-      sessionID,
-      assistantMessageID,
-      parentUserMessageID,
-    );
+    // Intentionally a no-op. Completion is handled by waitForPromptCompletion
+    // polling. The event stream fires for EVERY completed assistant message,
+    // including intermediate ones during the agent tool-call loop, so reacting
+    // here would prematurely abort the agent before the final answer arrives.
   }
 
   private async completeActivePrompt(
@@ -611,48 +659,55 @@ export class BridgeController {
     diffMessageID: string,
     directParts?: ReadonlyArray<{ type: string; [key: string]: unknown }>,
   ): Promise<void> {
-    const state = await this.syncState();
-    if (!this.lease.isOwner(state)) return;
-    if (!state.activePrompt) return;
-    if (state.bound.sessionID !== sessionID) return;
+    // Guard against duplicate completion from event stream + polling race
+    if (this.completionInFlight) return;
+    this.completionInFlight = true;
+    try {
+      const state = await this.syncState();
+      if (!this.lease.isOwner(state)) return;
+      if (!state.activePrompt) return;
+      if (state.bound.sessionID !== sessionID) return;
 
-    const summary = await this.buildSummary(
-      sessionID,
-      assistantMessageID,
-      diffMessageID,
-      directParts,
-    );
-    const completedAt = this.deps.now();
-    const elapsed = completedAt - (state.activePrompt.startedAt ?? state.activePrompt.createdAt);
-    const message = formatSummaryForTelegram(summary, this.config.summaryMaxChars);
-    await this.telegram.sendMessage(
-      this.config.channelID,
-      `completed in ${formatAgeMs(Math.max(0, elapsed))}`,
-      { replyToMessageID: state.activePrompt.telegramMessageID },
-    );
-    await this.telegram.sendMessage(
-      this.config.channelID,
-      message,
-      { replyToMessageID: state.activePrompt.telegramMessageID },
-    );
+      // Removed session.abort() because we want the agent to finish its turn naturally,
+      // avoiding "interrupted" UI states.
 
-    await this.persist(
-      this.appendPromptHistory(
-        {
-          ...state,
-          activePrompt: undefined,
-        },
-        {
-          jobID: state.activePrompt.userMessageID,
-          prompt: state.activePrompt.prompt,
-          summary: summary.text,
-          changedFiles: summary.changedFiles,
-          status: "completed",
-          at: completedAt,
-        },
-      ),
-    );
-    await this.processPromptQueue();
+      const summary = await this.buildSummary(
+        sessionID,
+        assistantMessageID,
+        diffMessageID,
+        directParts,
+      );
+      const completedAt = this.deps.now();
+      const elapsed = completedAt - (state.activePrompt.startedAt ?? state.activePrompt.createdAt);
+      const resultText = formatSummaryForTelegram(summary, this.config.summaryMaxChars);
+      const combinedMessage = `✅ completed in ${formatAgeMs(Math.max(0, elapsed))}\n\n${resultText}`;
+      await this.telegram.sendMessage(
+        this.config.channelID,
+        combinedMessage,
+        { replyToMessageID: state.activePrompt.telegramMessageID },
+      );
+
+      await this.persist(
+        this.appendPromptHistory(
+          {
+            ...state,
+            activePrompt: undefined,
+          },
+          {
+            jobID: state.activePrompt.userMessageID,
+            prompt: state.activePrompt.prompt,
+            summary: summary.text,
+            changedFiles: summary.changedFiles,
+            status: "completed",
+            at: completedAt,
+          },
+        ),
+      );
+
+      await this.processPromptQueue();
+    } finally {
+      this.completionInFlight = false;
+    }
   }
 
   private async onUserMessage(
@@ -663,11 +718,13 @@ export class BridgeController {
     if (!this.lease.isOwner(state)) return;
     if (state.bound.status !== "online") return;
     if (state.bound.sessionID !== sessionID) return;
-    if (userMessageID.startsWith("tg-")) return;
+    if (userMessageID.startsWith("msg_tg_")) return;
     if (state.activePrompt) return;
 
     try {
-      await this.client.session.abort({ path: { id: sessionID } });
+      await this.client.session.abort(
+        { sessionID, directory: this.api.state.path.directory },
+      );
     } catch {}
     this.api.ui.toast({
       variant: "warning",
@@ -880,14 +937,10 @@ export class BridgeController {
 
     let changedFiles: string[] = [];
     try {
-      const diffResponse = await this.client.session.message({
-        path: {
-          id: sessionID,
-          messageID: userMessageID,
-        },
-        responseStyle: "data",
-        throwOnError: true,
-      });
+      const diffResponse = await this.client.session.message(
+        { sessionID, messageID: userMessageID, directory: this.api.state.path.directory },
+        { responseStyle: "data", throwOnError: true },
+      );
       const diff = (diffResponse as any)?.diff as Array<{ file: string }> | undefined;
       changedFiles = (diff || []).map((item) => item.file);
     } catch {
@@ -1081,11 +1134,10 @@ export class BridgeController {
       return;
     }
     try {
-      await this.client.session.summarize({
-        path: { id: state.bound.sessionID },
-        responseStyle: "data",
-        throwOnError: true,
-      });
+      await this.client.session.summarize(
+        { sessionID: state.bound.sessionID, directory: this.api.state.path.directory },
+        { responseStyle: "data", throwOnError: true },
+      );
       await this.telegram.sendMessage(
         this.config.channelID,
         `Compaction requested for session ${state.bound.sessionID}.`,
@@ -1278,7 +1330,9 @@ export class BridgeController {
     }
 
     try {
-      await this.client.session.abort({ path: { id: state.bound.sessionID } });
+      await this.client.session.abort(
+        { sessionID: state.bound.sessionID, directory: this.api.state.path.directory },
+      );
       const latest = await this.requireState();
       if (latest.activePrompt?.userMessageID === state.activePrompt.userMessageID) {
         await this.persist(
@@ -1379,11 +1433,10 @@ export class BridgeController {
   private async getSessionTitle(sessionID: string | undefined): Promise<string | undefined> {
     if (!sessionID) return undefined;
     try {
-      const response = await this.client.session.get({
-        path: { id: sessionID },
-        responseStyle: "data",
-        throwOnError: true,
-      });
+      const response = await this.client.session.get(
+        { sessionID, directory: this.api.state.path.directory },
+        { responseStyle: "data", throwOnError: true },
+      );
       const title = (response as any)?.title ?? (response as any)?.session?.title;
       if (typeof title === "string" && title.trim().length > 0) return title.trim();
       return undefined;
@@ -1667,13 +1720,10 @@ export class BridgeController {
 
     this.activePromptCheckInFlight = true;
     try {
-      const response = await this.client.session.messages({
-        path: {
-          id: state.bound.sessionID,
-        },
-        responseStyle: "data",
-        throwOnError: true,
-      });
+      const response = await this.client.session.messages(
+        { sessionID: state.bound.sessionID, directory: this.api.state.path.directory },
+        { responseStyle: "data", throwOnError: true },
+      );
       const messages = Array.isArray(response) ? response : (response?.messages || response?.items || response?.data || []);
       const threshold = (state.activePrompt.startedAt ?? state.activePrompt.createdAt) - 1_000;
       const latestCompletedAssistant = [...messages]
@@ -1703,21 +1753,25 @@ export class BridgeController {
 
   private async clearTuiPrompt(): Promise<void> {
     try {
-      await this.client.tui.clearPrompt({
-        responseStyle: "data",
-        throwOnError: true,
-      });
+      await this.client.tui.clearPrompt(
+        {},
+        { responseStyle: "data", throwOnError: true },
+      );
     } catch {}
   }
 
   private async waitForPromptCompletion(
     sessionID: string,
     userMessageID: string,
-    assistantMessageID?: string,
+    _assistantMessageID?: string,
   ): Promise<void> {
     const startedAt = this.deps.now();
     const timeoutMs = 10 * 60 * 1000;
     const pollEveryMs = 2000;
+    const stableDelayMs = 3000; // Wait 3s of no new messages before declaring done
+
+    let lastSeenAssistantID: string | undefined;
+    let stableSince: number | undefined;
 
     while (this.deps.now() - startedAt < timeoutMs) {
       const state = await this.syncState();
@@ -1726,44 +1780,83 @@ export class BridgeController {
       if (!state.activePrompt || state.activePrompt.userMessageID !== userMessageID) return;
 
       try {
-        const response = await this.client.session.messages({
-          path: {
-            id: sessionID,
-          },
-          responseStyle: "data",
-          throwOnError: true,
-        });
+        // 1. Poll the session status
+        let isIdle = false;
+        try {
+          const statusResponse = await this.client.session.status(
+            { query: { directory: this.api.state.path.directory } },
+            { responseStyle: "data", throwOnError: true }
+          );
+          const statusType = statusResponse?.type || statusResponse?.data?.type;
+          isIdle = statusType === "idle";
+        } catch (statusErr) {
+          this.log(`waitForPromptCompletion: failed to get session status: ${String(statusErr)}`);
+        }
+
+        const response = await this.client.session.messages(
+          { sessionID, directory: this.api.state.path.directory },
+          { responseStyle: "data", throwOnError: true },
+        );
         const messages = Array.isArray(response) ? response : (response?.messages || response?.items || response?.data || []);
+
+        // 2. Find the user message created after we started
+        const userMessage = [...messages]
+          .reverse()
+          .find((entry: any) => {
+            const info = entry?.info;
+            if (info?.role !== "user") return false;
+            const created = info?.time?.created || 0;
+            if (created > 0 && created < startedAt - 5000) return false;
+            return true;
+          });
+        const actualUserMessageID = userMessage?.info?.id || userMessageID;
+
+        // Find the LATEST completed assistant message created after we started
         const completedAssistant = [...messages]
           .reverse()
           .find((entry: any) => {
             const info = entry?.info;
             if (info?.role !== "assistant") return false;
-            if (assistantMessageID && info.id !== assistantMessageID) return false;
-            if (info?.error) return true;
-            
-            const isCompleted = typeof info?.time?.completed === "number";
-            if (!isCompleted) return false;
-
-            // If we don't have a specific ID, ensure this message wasn't created before we started
-            if (!assistantMessageID) {
-              const created = info?.time?.created || 0;
-              if (created > 0 && created < startedAt - 5000) return false; // 5s buffer
-            }
-            
+            if (!info?.time?.completed) return false;
+            const created = info?.time?.created || 0;
+            if (created > 0 && created < startedAt - 5000) return false;
             return true;
           });
+
         if (completedAssistant?.info?.id) {
           if (completedAssistant.info.error) {
             throw new Error(`Assistant error: ${JSON.stringify(completedAssistant.info.error)}`);
           }
-          await this.completeActivePrompt(
-            sessionID,
-            completedAssistant.info.id,
-            userMessageID,
-            completedAssistant.parts,
-          );
-          return;
+
+          // If the session status is idle, we can fast-path immediately
+          if (isIdle) {
+            this.log(`waitForPromptCompletion: session is idle, fast-path completing`);
+            await this.completeActivePrompt(
+              sessionID,
+              completedAssistant.info.id,
+              actualUserMessageID,
+              completedAssistant.parts,
+            );
+            return;
+          }
+
+          // Stable-state detection: wait until no NEW assistant messages appear
+          if (completedAssistant.info.id !== lastSeenAssistantID) {
+            // New message appeared — reset the stability timer
+            lastSeenAssistantID = completedAssistant.info.id;
+            stableSince = this.deps.now();
+            this.log(`waitForPromptCompletion: new assistant message ${completedAssistant.info.id}, resetting stability timer`);
+          } else if (stableSince && (this.deps.now() - stableSince >= stableDelayMs)) {
+            // Same message for stableDelayMs — model has stopped, we're done
+            this.log(`waitForPromptCompletion: stable for ${stableDelayMs}ms, completing`);
+            await this.completeActivePrompt(
+              sessionID,
+              completedAssistant.info.id,
+              actualUserMessageID,
+              completedAssistant.parts,
+            );
+            return;
+          }
         }
       } catch (err) {
         if (err instanceof Error && err.message.startsWith("Assistant error:")) {

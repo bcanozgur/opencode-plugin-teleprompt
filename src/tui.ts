@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import { join } from "node:path";
 import { loadConfig } from "./config.js";
 import { BridgeController } from "./runtime/controller.js";
@@ -24,6 +25,41 @@ async function runSafe(
   }
 }
 
+function promptUser(
+  api: TuiPluginApi,
+  title: string,
+  placeholder?: string,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    api.ui.dialog.replace(
+      () =>
+        api.ui.DialogPrompt({
+          title,
+          placeholder,
+          onConfirm: (val) => {
+            if (settled) return;
+            settled = true;
+            api.ui.dialog.clear();
+            resolve(val);
+          },
+          onCancel: () => {
+            if (settled) return;
+            settled = true;
+            api.ui.dialog.clear();
+            reject(new Error("Cancelled"));
+          },
+        }),
+      () => {
+        if (!settled) {
+          settled = true;
+          reject(new Error("Closed"));
+        }
+      },
+    );
+  });
+}
+
 export const tui: TuiPlugin = async (
   api: TuiPluginApi,
   _options?: Record<string, unknown>,
@@ -33,31 +69,34 @@ export const tui: TuiPlugin = async (
   const controller = new BridgeController(api, config, storePath);
   await controller.init();
 
-  if (config.botToken && config.channelID) {
-    setTimeout(() => {
-      // DUMP DEV TOOL
-      try {
-        const fs = require('node:fs');
-        const dump = {
-          routeKeys: Object.keys(api.route || {}),
-          apiKeys: Object.keys(api || {}),
-          commandKeys: Object.keys(api.command || {}),
-          uiKeys: Object.keys(api.ui || {}),
-          hasNavigate: typeof (api as any).navigate,
-          routeCurrent: api.route?.current
-        };
-        fs.writeFileSync(storePath + '.debug.json', JSON.stringify(dump, null, 2));
-      } catch (e) {}
-
-      void runSafe(api, async () => {
-        const state = await controller.syncState();
-        if (state.bound.status !== "online" || !state.bound.sessionID) {
-          const sessionID = await controller.bindCurrent();
-          return `Telegram bridge auto-bound to session ${sessionID}`;
-        }
-      });
-    }, 500);
-  }
+  setTimeout(() => {
+    // DUMP DEV TOOL
+    try {
+      const c = api.client as any;
+      const dump = {
+        routeKeys: Object.keys(api.route || {}),
+        apiKeys: Object.keys(api || {}),
+        commandKeys: Object.keys(api.command || {}),
+        uiKeys: Object.keys(api.ui || {}),
+        hasNavigate: typeof (api as any).navigate,
+        routeCurrent: api.route?.current,
+        clientType: typeof c,
+        clientKeys: c ? Object.keys(c).slice(0, 20) : [],
+        sessionType: typeof c?.session,
+        sessionKeys: c?.session ? Object.keys(c.session).slice(0, 20) : [],
+        messagesMethodSrc: c?.session?.messages?.toString?.()?.slice(0, 500),
+        promptAsyncMethodSrc: c?.session?.promptAsync?.toString?.()?.slice(0, 500),
+        abortMethodSrc: c?.session?.abort?.toString?.()?.slice(0, 500),
+        getMethodSrc: c?.session?.get?.toString?.()?.slice(0, 500),
+        listMethodSrc: c?.session?.list?.toString?.()?.slice(0, 200),
+        createMethodSrc: c?.session?.create?.toString?.()?.slice(0, 200),
+        tuiAppendPromptSrc: c?.tui?.appendPrompt?.toString?.()?.slice(0, 500),
+        tuiClearPromptSrc: c?.tui?.clearPrompt?.toString?.()?.slice(0, 500),
+        tuiSubmitPromptSrc: c?.tui?.submitPrompt?.toString?.()?.slice(0, 500),
+      };
+      fs.writeFileSync(storePath + '.debug.json', JSON.stringify(dump, null, 2));
+    } catch (e) {}
+  }, 500);
 
   const unregister = api.command.register(() => [
     {
@@ -71,7 +110,29 @@ export const tui: TuiPlugin = async (
       },
       onSelect: () => {
         void runSafe(api, async () => {
-          const sessionID = await controller.bindCurrent();
+          let botToken = config.botToken;
+          let channelID = config.channelID;
+
+          if (!botToken || !channelID) {
+            try {
+              if (!botToken) {
+                botToken = await promptUser(api, "Telegram Bot Token", "e.g., 8776307514:AAHbgKGZrzJUM6T...");
+                // Add a small delay for the UI rendering loop to settle before showing the next dialog
+                await new Promise((res) => setTimeout(res, 200));
+              }
+              if (!channelID) {
+                channelID = await promptUser(api, "Telegram Channel ID", "e.g., -1003902302579");
+              }
+            } catch (err) {
+              api.ui.toast({
+                variant: "info",
+                message: "Telegram setup cancelled.",
+              });
+              return;
+            }
+          }
+
+          const sessionID = await controller.bindCurrent({ botToken, channelID });
           return `Telegram bridge bound to session ${sessionID}`;
         });
       },

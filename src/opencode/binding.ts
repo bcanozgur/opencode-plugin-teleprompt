@@ -24,10 +24,11 @@ export async function getCurrentOrCreateSessionID(
     }
   }
 
-  const response = await client.session.create({
-    responseStyle: "data",
-    throwOnError: true,
-  });
+  // Bundled SDK convention: (params, options)
+  const response = await client.session.create(
+    { directory: api.state.path.directory },
+    { responseStyle: "data", throwOnError: true },
+  );
 
   // Try multiple common paths for session ID
   const sessionID =
@@ -46,8 +47,6 @@ export async function getCurrentOrCreateSessionID(
 
   try {
     const route = api.route as any;
-    // According to debug dump, api.route.navigate exists
-    // Reverting to positional arguments as the object-based call caused a crash
     if (typeof route.navigate === "function") {
       route.navigate("session", { sessionID });
     } else if (typeof route.push === "function") {
