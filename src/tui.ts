@@ -116,12 +116,12 @@ export const tui: TuiPlugin = async (
           if (!botToken || !channelID) {
             try {
               if (!botToken) {
-                botToken = await promptUser(api, "Telegram Bot Token", "e.g., 8776307514:AAHbgKGZrzJUM6T...");
+                botToken = await promptUser(api, "Telegram Bot Token", "e.g., 1234567890:AAExampleToken...");
                 // Add a small delay for the UI rendering loop to settle before showing the next dialog
                 await new Promise((res) => setTimeout(res, 200));
               }
               if (!channelID) {
-                channelID = await promptUser(api, "Telegram Channel ID", "e.g., -1003902302579");
+                channelID = await promptUser(api, "Telegram Channel ID", "e.g., -1001234567890");
               }
             } catch (err) {
               api.ui.toast({

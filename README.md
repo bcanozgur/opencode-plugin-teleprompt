@@ -1,54 +1,36 @@
 # opencode-plugin-teleprompt
 
-TUI-scoped OpenCode plugin that binds a Telegram channel to one active OpenCode session.
+Control an active OpenCode TUI session from Telegram.
 
-## What It Does
+`opencode-plugin-teleprompt` binds one Telegram channel to one OpenCode session so
+you can send prompts, monitor progress, approve tool permissions, answer
+OpenCode questions, and receive concise result summaries without being at your
+keyboard.
 
-- **Frictionless Chat Interface**: Type direct prompts (like `write a python function`) in your Telegram channel without any prefixes!
-- **Direct Slash Commands**: Run administrative commands like `/status`, `/queue`, `/dc` or `/approve <id>` directly in the Telegram channel.
-- **Backward Compatibility**: Fully supports old `/tp <prompt>` and `/tp:<command>` syntax out of the box.
-- **Relays Permission Prompts**: Directly relays OpenCode permission requests and accepts direct `/approve`, `/approve-always`, and `/deny` replies.
-- **Inline Keyboards For Approvals**: Permission prompts arrive as Telegram messages with `Approve once` / `Approve always` / `Deny` buttons — no typing required.
-- **Relays OpenCode Questions**: When the agent asks the user a question (via the OpenCode `question` tool), teleprompt posts it to Telegram with inline option buttons (single-choice direct, multi-choice with toggle+confirm). Tap to reply, or fall back to `/qreply`/`/qreject` text commands.
-- **Lease-based Owner Semantics**: Keeps single-owner bridge semantics across multiple OpenCode consoles.
-- **Instant Ctrl+C Exit**: Stops event streams and cleans up instantly, ensuring no exit lags when shutting down OpenCode.
+## Highlights
 
-## V1 Limits
-
-- Single strict channel
-- Single active bound session
-- Summary-only output (no full transcript)
-- No auto-bind on startup
+- Send normal Telegram messages as OpenCode prompts.
+- Track lifecycle updates: `accepted`, `queued`, `running`,
+  `waiting-permission`, `waiting-question`, `completed`, and `failed`.
+- Approve or deny OpenCode permission requests from Telegram with inline
+  buttons.
+- Answer OpenCode question prompts with Telegram inline keyboards, including
+  multi-select questions.
+- Queue, cancel, retry, interrupt, compact, and switch sessions from Telegram.
+- Keep a single active bridge owner with lease-based coordination across
+  multiple OpenCode consoles.
+- Disconnect cleanly with `/dc`, `/tp:stop`, or a double `Esc` in OpenCode.
 
 ## Requirements
 
-- Telegram bot token
-- Bot must be an admin in the target channel
-- Telegram credentials can be provided either:
-  - via env vars (`OPENCODE_TELEGRAM_BOT_TOKEN`, `OPENCODE_TELEGRAM_CHANNEL_ID`)
-  - or at runtime with `/tp:start <bot_token> <channel_id>` or `/tp:credentials <bot_token> <channel_id>`
+- Node.js 20 or newer
+- OpenCode with plugin support
+- A Telegram bot token
+- A Telegram channel where the bot is an admin
 
-Optional:
+## Installation
 
-- `OPENCODE_TELEGRAM_POLL_TIMEOUT_SEC` (default: `30`)
-- `OPENCODE_TELEGRAM_HEARTBEAT_MS` (default: `10000`)
-- `OPENCODE_TELEGRAM_LEASE_TTL_MS` (default: `30000`)
-- `OPENCODE_TELEGRAM_SUMMARY_MAX_CHARS` (default: `1200`)
-- `OPENCODE_TELEGRAM_ONLINE_NOTICE` (`true`/`false`, default: `true`)
-- `OPENCODE_TELEGRAM_OFFLINE_NOTICE` (`true`/`false`, default: `true`)
-
-## Install And Build
-
-```bash
-npm install
-npm run build
-```
-
-## Install In OpenCode (npm package)
-
-Add this plugin package name into your OpenCode config:
-
-`opencode.json`
+Add the package to your OpenCode config:
 
 ```json
 {
@@ -57,145 +39,181 @@ Add this plugin package name into your OpenCode config:
 }
 ```
 
-OpenCode installs npm plugins automatically at startup.
+OpenCode installs npm plugins on startup.
 
-## Activation And Use
+## Telegram Setup
 
-1. Publish this package to npm.
-2. Add package name to `opencode.json` as shown above.
-3. Open a session in OpenCode TUI.
-4. Run `/tp:start` in OpenCode to activate teleprompt for the current session.
-   - If env vars are missing, run `/tp:start <bot_token> <channel_id>` once (or `/tp:credentials <bot_token> <channel_id>` then `/tp:start`).
-   - Runtime credentials are session-only and are cleared on plugin/session shutdown.
-5. While teleprompt is active, local prompt input is locked for that session.
-6. Disconnect options:
-   - Press `Esc` twice in a row in OpenCode
-   - Send `/dc` in Telegram channel
-   - Run `/tp:stop` in OpenCode
-7. Use Telegram channel commands:
-   - `<prompt>` (any message NOT starting with `/` is treated directly as a prompt!)
-   - `/interrupt` (or `/tp:interrupt`)
-   - `/queue` (or `/tp:queue`)
-   - `/cancel <job_id|last>` (or `/tp:cancel <job_id|last>`)
-   - `/retry` (or `/tp:retry`)
-   - `/context` (or `/tp:context`)
-   - `/compact` (or `/tp:compact`)
-   - `/newsession` (or `/tp:newsession`)
-   - `/reset-context` (or `/tp:reset-context`)
-   - `/who` (or `/tp:who`)
-   - `/health` (or `/tp:health`)
-   - `/reclaim` (or `/tp:reclaim`)
-   - `/history` (or `/tp:history`)
-   - `/last-error` (or `/tp:last-error`)
-   - `/model` (or `/tp:model`)
-   - `/model fast` (or `/tp:model fast`)
-   - `/model smart` (or `/tp:model smart`)
-   - `/model max` (or `/tp:model max`)
-   - `/model <provider>/<model>`
-    - `/approve <request_id>`
-    - `/approve-always <request_id>`
-    - `/deny <request_id>`
-    - `/qreply <request_id>` (then `<index>:<label1>|<label2>` lines for each question)
-    - `/qreject <request_id>`
-    - `/status`
-   - `/dc` (or `/tp:dc`)
+Create a bot with BotFather, add it to your Telegram channel, and make it an
+admin. Then provide credentials with environment variables:
 
-During remote runs, teleprompt posts lifecycle updates (`accepted`, `queued`, `running`, `waiting-permission`, `completed`, `failed`) and result summaries are sent as replies to the originating Telegram message for clear correlation.
+```bash
+export OPENCODE_TELEGRAM_BOT_TOKEN="..."
+export OPENCODE_TELEGRAM_CHANNEL_ID="..."
+```
 
-## Publish And Install Verification
+You can also provide credentials for the current OpenCode runtime only:
 
-### npm Publish Preparation
+```text
+/tp:start <bot_token> <channel_id>
+```
 
-1. Run release validation locally:
-   - `npm run verify:release`
-2. Validate npm auth/account:
-   - `npm whoami`
-3. Publish:
-   - `npm publish`
+Runtime credentials are cleared when the plugin or session shuts down.
 
-`prepublishOnly` is enabled and will run release verification automatically before publishing.
+## Quick Start
 
-### Clean-Machine Install Checklist
+1. Start OpenCode.
+2. Open or create the session you want to control.
+3. Run `/tp:start` inside the OpenCode TUI.
+4. Send a message in the Telegram channel, for example:
 
-1. On a clean machine, create `opencode.json` with:
-   - `"plugin": ["opencode-plugin-teleprompt"]`
-2. Set required env vars:
-   - `OPENCODE_TELEGRAM_BOT_TOKEN`
-   - `OPENCODE_TELEGRAM_CHANNEL_ID`
-3. Start OpenCode and ensure plugin loads without startup errors.
-4. Open one session, run `/tp:start`, verify bridge binds.
-5. Send `/status` from Telegram and confirm status response.
-6. Send `test ping` and confirm lifecycle + summary reply.
-7. Send `/dc` and confirm local input is unlocked in OpenCode.
+   ```text
+   summarize the current repository and suggest the next improvement
+   ```
 
-## Telegram Live E2E Quick Checklist
+5. Watch lifecycle updates in Telegram.
+6. Receive the final summary as a reply to your original Telegram message.
+7. Disconnect with `/dc` in Telegram or `/tp:stop` in OpenCode.
 
-1. Start OpenCode session and run `/tp:start`.
-2. From Telegram channel, run `/status` and verify owner/session info.
-3. Run `/model` and switch once with `/model fast` (or explicit provider/model).
-4. Send `write a 1-line summary of this session` and verify:
-   - `accepted` -> `running` -> `completed`
-   - summary arrives as reply to the same Telegram message
-5. Trigger a permissioned action prompt and verify:
-   - plugin posts a permission request message with `Approve once`,
-     `Approve always`, and `Deny` inline buttons
-   - tapping a button (or typing `/approve <request_id>` / `/deny <request_id>`)
-     applies the reply via the OpenCode SDK and removes the buttons
-6. Trigger an OpenCode question (e.g. "what's the goal?") and verify:
-   - plugin posts a `waiting-question` notice and the question with
-     inline option buttons
-   - single-choice: tapping an option button replies via
-     `client.question.reply` and removes the buttons
-   - multi-choice: toggling options marks them with ✅ and a `Confirm`
-     button finalizes the reply with all selected labels
-   - text fallback: `/qreply <request_id>` with one
-     `<index>:<label1>|<label2>` line per question
-7. Send `/interrupt` during a long run and confirm graceful stop.
-8. Send `/dc` and confirm disconnect/unlock behavior.
+While the bridge is active, local prompt input for the bound session is locked so
+the Telegram channel remains the active remote control surface.
+
+## How It Works
+
+Teleprompt is a TUI-scoped bridge. It starts only after `/tp:start`, binds to the
+current OpenCode session, and polls one configured Telegram channel. Normal
+Telegram messages become queued OpenCode prompts. Slash commands manage the
+bridge and the session.
+
+When OpenCode asks for a permission decision, Teleprompt sends a Telegram message
+with `Approve once`, `Approve always`, and `Deny` buttons. When OpenCode asks a
+question, Teleprompt sends each question with option buttons. Tapping a button
+replies through the OpenCode SDK and removes the inline keyboard from Telegram.
 
 ## Command Reference
 
-### OpenCode Local Commands
+### OpenCode Commands
 
-- `/tp:start`: Bind teleprompt to the current OpenCode session and start Telegram polling.
-- `/tp:start <bot_token> <channel_id>`: Bind with session-only credentials when env vars are not set.
-- `/tp:credentials <bot_token> <channel_id>`: Store session-only credentials for the current runtime.
-- `/tp:stop`: Unbind teleprompt, stop polling, and unlock local session input.
-- `/tp:status`: Show current bridge status in OpenCode (session, owner, model, queue, permissions).
+| Command | Description |
+| --- | --- |
+| `/tp:start` | Bind Teleprompt to the current OpenCode session. |
+| `/tp:start <bot_token> <channel_id>` | Start with session-only Telegram credentials. |
+| `/tp:credentials <bot_token> <channel_id>` | Store session-only credentials for this runtime. |
+| `/tp:status` | Show bridge status in OpenCode. |
+| `/tp:stop` | Stop polling, release the bridge, and unlock local input. |
 
 ### Telegram Commands
 
-- `<prompt>`: Any message not starting with `/` is queued directly as a prompt for the session.
-- `/interrupt`: Abort the currently running remote prompt without disconnecting the bridge.
-- `/queue`: Show active prompt and queued prompts.
-- `/cancel <job_id|last>`: Remove a queued prompt by job ID, or remove the newest queued prompt with `last`.
-- `/retry`: Re-queue the most recent prompt from prompt history.
-- `/context`: Show compact session context (recent prompts, summaries, and changed files).
-- `/compact`: Trigger session summarization/compaction for long-running sessions.
-- `/newsession`: Create a new OpenCode session and switch teleprompt binding to it.
-- `/reset-context`: Alias behavior for creating/switching to a fresh session context.
-- `/who`: Show lease ownership details (current instance, lease owner, ownership state).
-- `/health`: Show bridge health (lease age/staleness, poller/event stream status, queue stats).
-- `/reclaim`: Try to reclaim bridge ownership for the current instance.
-- `/history`: Show recent run history with status and short summaries.
-- `/last-error`: Show the latest failed or interrupted run summary.
-- `/model`: List available models by provider and show current model selection.
-- `/model fast`: Select a model using the `fast` preset resolver.
-- `/model smart`: Select a model using the `smart` preset resolver.
-- `/model max`: Select a model using the `max` preset resolver.
-- `/model <provider>/<model>`: Select an explicit provider/model for the bound session.
-- `/approve <request_id>`: Approve a pending permission request once.
-- `/approve-always <request_id>`: Approve a pending permission request and persist approval behavior when supported.
-- `/deny <request_id>`: Reject a pending permission request.
-- `/qreply <request_id>`: Answer an OpenCode question. Follow with one line per
-  question in the form `<index>:<label1>|<label2>`. Only known option labels
-  are accepted; unknown labels are dropped. As a fallback to the inline
-  keyboard buttons, you can also use this for single-choice questions.
-- `/qreject <request_id>`: Reject an OpenCode question without answering it.
-- `/status`: Show bridge status from Telegram.
-- `/dc`: Disconnect teleprompt from Telegram and unbind the current session.
+| Command | Description |
+| --- | --- |
+| `<prompt>` | Queue a prompt. Any message not starting with `/` is treated as input. |
+| `/status` | Show bridge status. |
+| `/queue` | Show the active prompt and queued prompts. |
+| `/cancel <job_id\|last>` | Cancel a queued prompt. |
+| `/retry` | Re-queue the most recent prompt. |
+| `/interrupt` | Stop the currently running remote prompt. |
+| `/context` | Show compact session context. |
+| `/compact` | Request OpenCode context compaction. |
+| `/newsession` | Create and bind a new OpenCode session. |
+| `/reset-context` | Start a fresh session context. |
+| `/who` | Show bridge ownership details. |
+| `/health` | Show poller, event stream, lease, and queue health. |
+| `/reclaim` | Try to reclaim bridge ownership for the current instance. |
+| `/history` | Show recent remote runs. |
+| `/last-error` | Show the latest failed or interrupted run. |
+| `/model` | Show available models and the current model. |
+| `/model fast` | Select the `fast` model preset. |
+| `/model smart` | Select the `smart` model preset. |
+| `/model max` | Select the `max` model preset. |
+| `/model <provider>/<model>` | Select an explicit provider/model. |
+| `/approve <request_id>` | Approve a pending permission once. |
+| `/approve-always <request_id>` | Approve a pending permission persistently when supported. |
+| `/deny <request_id>` | Deny a pending permission. |
+| `/qreply <request_id>` | Answer an OpenCode question with text fallback syntax. |
+| `/qreject <request_id>` | Reject an OpenCode question. |
+| `/dc` | Disconnect Teleprompt from Telegram and unbind the session. |
 
-## Shutdown Behavior
+The legacy `/tp <prompt>` and `/tp:<command>` Telegram forms are still accepted
+for compatibility.
 
-- On normal TUI disposal (`Ctrl+C`, clean exit), poller and heartbeat stop and lease is released **instantly** without hangs.
-- On unclean termination, lease expires by TTL and next owner instance can reclaim.
+## Permission And Question Handling
+
+Permission requests are delivered to Telegram with inline buttons:
+
+```text
+Approve once | Approve always | Deny
+```
+
+Question prompts are delivered with option buttons. Single-choice questions send
+the answer immediately when tapped. Multi-choice questions allow toggling options
+and then confirming the selected labels.
+
+Text fallbacks are available when inline buttons are not convenient:
+
+```text
+/approve <request_id>
+/deny <request_id>
+/qreply <request_id>
+0:TypeScript|Go
+1:Postgres
+/qreject <request_id>
+```
+
+## Configuration
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `OPENCODE_TELEGRAM_BOT_TOKEN` | none | Telegram bot token. |
+| `OPENCODE_TELEGRAM_CHANNEL_ID` | none | Telegram channel ID to accept updates from. |
+| `OPENCODE_TELEGRAM_POLL_TIMEOUT_SEC` | `30` | Telegram long-poll timeout. |
+| `OPENCODE_TELEGRAM_HEARTBEAT_MS` | `10000` | Bridge heartbeat interval. |
+| `OPENCODE_TELEGRAM_LEASE_TTL_MS` | `30000` | Lease expiry for reclaiming stale owners. |
+| `OPENCODE_TELEGRAM_SUMMARY_MAX_CHARS` | `1200` | Maximum Telegram summary length. |
+| `OPENCODE_TELEGRAM_ONLINE_NOTICE` | `true` | Send notice when the bridge comes online. |
+| `OPENCODE_TELEGRAM_OFFLINE_NOTICE` | `true` | Send notice when the bridge goes offline. |
+
+## Current Scope
+
+Teleprompt currently focuses on one reliable remote-control workflow:
+
+- one Telegram channel
+- one active bound OpenCode session
+- summary replies instead of full transcript mirroring
+- explicit `/tp:start` activation per OpenCode runtime
+
+These limits keep bridge ownership and permission handling predictable. Broader
+multi-channel or auto-bind behavior can be explored in future releases.
+
+## Development
+
+```bash
+npm install
+npm test
+npm run typecheck
+npm run build
+```
+
+Release verification:
+
+```bash
+npm run verify:release
+```
+
+`prepublishOnly` runs release verification automatically before `npm publish`.
+
+## Contributing
+
+Issues and pull requests are welcome. Useful reports include:
+
+- OpenCode version
+- plugin version
+- Node.js version
+- the Telegram command or callback involved
+- expected behavior
+- actual behavior and relevant logs
+
+Please avoid sharing bot tokens, channel secrets, OpenCode credentials, or private
+repository content in public issues.
+
+## License
+
+MIT
