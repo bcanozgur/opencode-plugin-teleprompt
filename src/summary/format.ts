@@ -12,7 +12,7 @@ export function formatSummaryForTelegram(
 ): string {
   const lines: string[] = [];
   lines.push(payload.hadError ? "OpenCode result: error" : "OpenCode result:");
-  lines.push(trimTo(payload.text || "(no assistant text)", maxChars));
+  lines.push(trimTo(payload.text, maxChars));
   if (payload.changedFiles.length > 0) {
     lines.push("");
     lines.push("Changed files:");

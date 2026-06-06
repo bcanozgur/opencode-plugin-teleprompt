@@ -46,6 +46,35 @@ export type PendingPermission = {
   announcedAt: number;
 };
 
+export type QuestionOption = {
+  label: string;
+  description: string;
+};
+
+export type QuestionInfo = {
+  question: string;
+  header: string;
+  options: QuestionOption[];
+  multiple?: boolean;
+  custom?: boolean;
+};
+
+export type PendingQuestion = {
+  requestID: string;
+  sessionID: string;
+  questions: QuestionInfo[];
+  tool?: {
+    messageID: string;
+    callID: string;
+  };
+  announcedAt: number;
+};
+
+export type PendingQuestionAnswer = {
+  questionIndex: number;
+  labels: string[];
+};
+
 export type PromptHistoryItem = {
   jobID: string;
   prompt: string;
@@ -63,6 +92,8 @@ export type BridgeStoreData = {
   promptQueue: PromptJob[];
   activePrompt?: PromptJob;
   pendingPermissions: Record<string, PendingPermission>;
+  pendingQuestions: Record<string, PendingQuestion>;
+  questionAnswers: Record<string, PendingQuestionAnswer[]>;
   promptHistory: PromptHistoryItem[];
   recentPrompts: Array<{
     jobID: string;
@@ -76,6 +107,7 @@ export type TelegramUpdate = {
   update_id: number;
   message?: TelegramChannelPost;
   channel_post?: TelegramChannelPost;
+  callback_query?: TelegramCallbackQuery;
 };
 
 export type TelegramChannelPost = {
@@ -89,6 +121,35 @@ export type TelegramChannelPost = {
   text?: string;
 };
 
+export type TelegramCallbackQuery = {
+  id: string;
+  from: {
+    id: number;
+    is_bot?: boolean;
+    first_name?: string;
+  };
+  message?: {
+    message_id: number;
+    date: number;
+    chat: {
+      id: number | string;
+      type: string;
+    };
+    text?: string;
+  };
+  chat_instance?: string;
+  data?: string;
+};
+
+export type TelegramInlineKeyboardButton = {
+  text: string;
+  callback_data: string;
+};
+
+export type TelegramInlineKeyboardMarkup = {
+  inline_keyboard: TelegramInlineKeyboardButton[][];
+};
+
 export type TelegramCommandPrompt = {
   kind: "prompt";
   prompt: string;
@@ -98,6 +159,15 @@ export type TelegramCommandPermission = {
   kind: "permission";
   action: "once" | "always" | "reject";
   requestID: string;
+};
+
+export type TelegramCommandQuestionReply = {
+  kind: "question";
+  action: "reply" | "reject" | "toggle" | "confirm";
+  requestID: string;
+  answers?: PendingQuestionAnswer[];
+  questionIndex?: number;
+  optionIndex?: number;
 };
 
 export type TelegramCommandStatus = {
@@ -174,10 +244,16 @@ export type TelegramCommandModel = {
   preset?: "fast" | "smart" | "max";
 };
 
+export type TelegramCommandDiag = {
+  kind: "diag";
+};
+
 export type TelegramCommand =
   | TelegramCommandPrompt
   | TelegramCommandPermission
+  | TelegramCommandQuestionReply
   | TelegramCommandStatus
+  | TelegramCommandDiag
   | TelegramCommandDisconnect
   | TelegramCommandInterrupt
   | TelegramCommandQueue
@@ -201,6 +277,16 @@ export type ParsedTelegramCommand = {
   channelID: string;
   rawText: string;
   command: TelegramCommand;
+  callbackQueryID?: string;
+};
+
+export type ParsedCallbackQuery = {
+  updateID: number;
+  callbackQueryID: string;
+  channelID: string;
+  messageID: number;
+  rawData: string;
+  command: TelegramCommand;
 };
 
 export type SummaryPayload = {
@@ -220,4 +306,14 @@ export type PermissionAskInput = {
   permission: string;
   patterns: string[];
   metadata: Record<string, unknown>;
+};
+
+export type QuestionAskInput = {
+  id: string;
+  sessionID: string;
+  questions: QuestionInfo[];
+  tool?: {
+    messageID: string;
+    callID: string;
+  };
 };

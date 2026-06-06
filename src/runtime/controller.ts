@@ -4,20 +4,37 @@ import { appendFileSync } from "node:fs";
 import type {
   BridgeConfig,
   BridgeStoreData,
+  ParsedCallbackQuery,
   ParsedTelegramCommand,
+  PendingQuestion,
+  PendingQuestionAnswer,
   PromptHistoryItem,
   PromptJob,
   RuntimeDeps,
   SummaryPayload,
+  TelegramInlineKeyboardMarkup,
 } from "../types.js";
 import { getCurrentOrCreateSessionID } from "../opencode/binding.js";
-import { replyPermission, toPendingPermission, formatPermissionRequestMessage } from "../opencode/permissions.js";
+import {
+  formatPermissionRequestMessage,
+  formatQuestionRequestMessage,
+  normalizeAnswers,
+  rejectQuestion,
+  replyPermission,
+  replyQuestion,
+  toPendingPermission,
+  toPendingQuestion,
+} from "../opencode/permissions.js";
 import { createTelegramUserMessageID, submitPrompt } from "../opencode/submit.js";
 import { formatSummaryForTelegram } from "../summary/format.js";
 import { LeaseManager } from "../state/lease.js";
 import { BridgeStore } from "../state/store.js";
 import { TelegramApi } from "../telegram/api.js";
 import { TelegramPoller } from "../telegram/poller.js";
+import {
+  buildPermissionKeyboard,
+  buildQuestionKeyboard,
+} from "../telegram/callback.js";
 import { SessionEventStream } from "../opencode/events.js";
 import { createShutdownGuard } from "./shutdown.js";
 import type { TuiPluginApi } from "../tui-types.js";
@@ -147,6 +164,11 @@ export class BridgeController {
   private pollTask?: Promise<void>;
   private eventStream?: SessionEventStream;
   private eventRestartTimer?: ReturnType<typeof setTimeout>;
+  // Real-time text accumulator: messageID -> accumulated text from
+  // message.part.updated events. More reliable than the SDK's session.messages()
+  // or session.message() fetch (which can return 500s) or the TUI's local
+  // state.part() (which only has parts the TUI itself rendered).
+  private streamedText: Map<string, string> = new Map();
   private readonly shutdownOnce = createShutdownGuard();
   private processingQueue = false;
   private lastEscAt = 0;
@@ -159,11 +181,12 @@ export class BridgeController {
     private readonly config: BridgeConfig,
     private readonly storePath: string,
     deps?: Partial<RuntimeDeps>,
+    telegram?: TelegramApi,
   ) {
     this.deps = { ...DEFAULT_DEPS, ...deps };
     this.instanceID = this.deps.randomID();
     this.client = api.client;
-    this.telegram = new TelegramApi(config.botToken || "__missing_token__");
+    this.telegram = telegram ?? new TelegramApi(config.botToken || "__missing_token__");
     this.store = new BridgeStore(storePath, config.channelID ?? "");
     this.lease = new LeaseManager(
       this.instanceID,
@@ -179,6 +202,26 @@ export class BridgeController {
       appendFileSync(logPath, `[${timestamp}] ${message}\n`, "utf8");
     } catch {
       // ignore
+    }
+    try {
+      appendFileSync("/tmp/teleprompt-bridge.log", `[${new Date().toISOString()}] ${message}\n`, "utf8");
+    } catch {
+      // ignore
+    }
+  }
+
+  private async safeSendTelegram(
+    label: string,
+    text: string,
+    options?: {
+      replyToMessageID?: number;
+      replyMarkup?: TelegramInlineKeyboardMarkup;
+    },
+  ): Promise<void> {
+    try {
+      await this.telegram.sendMessage(this.config.channelID, text, options);
+    } catch (error) {
+      this.log(`${label} failed: ${String(error)} (textLength=${text.length})`);
     }
   }
 
@@ -249,8 +292,64 @@ export class BridgeController {
       activePrompt: undefined,
       promptQueue: [],
       pendingPermissions: {},
+      pendingQuestions: {},
+      questionAnswers: {},
     });
     await this.persist(released);
+  }
+
+  private async handleDiag(command: ParsedTelegramCommand): Promise<void> {
+    const lines: string[] = [];
+    try {
+      const me = await this.getTelegramApi().getMe();
+      lines.push(`Bot: ${me.id}${me.username ? ` @${me.username}` : ""}`);
+    } catch (err) {
+      lines.push(`Bot info: failed — ${String(err)}`);
+    }
+    try {
+      const chat = await this.getTelegramApi().getChat(this.requireChannelID());
+      lines.push(`Chat: ${chat.type}${chat.title ? ` "${chat.title}"` : ""}`);
+    } catch (err) {
+      lines.push(`Chat info: failed — ${String(err)}`);
+    }
+    try {
+      const me = await this.getTelegramApi().getMe();
+      const member = await this.getTelegramApi().getChatMember(
+        this.requireChannelID(),
+        me.id,
+      );
+      const status = String(member.status ?? "unknown");
+      lines.push(`Role: ${status}`);
+      const permKeys = ["can_edit_messages", "can_post_messages", "can_delete_messages",
+        "can_restrict_members", "can_promote_members", "can_invite_users",
+        "can_pin_messages", "is_anonymous", "can_manage_chat"];
+      const enabled = permKeys.filter(k => member[k] === true);
+      if (enabled.length > 0) {
+        lines.push(`Perms: ${enabled.join(", ")}`);
+      }
+      if (status === "administrator" && !enabled.includes("can_edit_messages")) {
+        lines.push("⚠️ Bot lacks 'can_edit_messages' — callback queries won't work in channels");
+      }
+    } catch (err) {
+      lines.push(`Bot member: failed — ${String(err)}`);
+    }
+    try {
+      const wh = await this.getTelegramApi().getWebhookInfo();
+      lines.push(`Webhook: ${wh.url || "(none)"}`);
+      lines.push(`Pending: ${wh.pending_update_count}`);
+      if (wh.last_error_message) {
+        lines.push(`Webhook error: ${wh.last_error_message}`);
+      }
+    } catch (err) {
+      lines.push(`Webhook: failed — ${String(err)}`);
+    }
+    lines.push(`Prefix: /${this.config.prefix}`);
+    lines.push(`Poll timeout: ${this.config.pollTimeoutSec}s`);
+    await this.telegram.sendMessage(
+      this.config.channelID,
+      lines.join("\n"),
+      { replyToMessageID: command.messageID },
+    );
   }
 
   async statusLine(): Promise<string> {
@@ -284,11 +383,19 @@ export class BridgeController {
     return lines.join("\n");
   }
 
-  async handleTelegramCommand(command: ParsedTelegramCommand): Promise<void> {
+  async handleTelegramCommand(command: ParsedTelegramCommand | ParsedCallbackQuery): Promise<void> {
+    if ((command as ParsedCallbackQuery).callbackQueryID) {
+      await this.handleTelegramCallback(command as ParsedCallbackQuery);
+      return;
+    }
+    await this.handleTelegramMessage(command as ParsedTelegramCommand);
+  }
+
+  private async handleTelegramMessage(command: ParsedTelegramCommand): Promise<void> {
     this.log(`handleTelegramCommand: kind=${command.command.kind}, updateID=${command.updateID}, messageID=${command.messageID}`);
     const state = await this.syncState();
     const isOwner = this.lease.isOwner(state);
-    const alwaysAllowed = new Set(["status", "who", "health", "reclaim", "version"]);
+    const alwaysAllowed = new Set(["status", "diag", "who", "health", "reclaim", "version"]);
     if (!isOwner && !alwaysAllowed.has(command.command.kind)) {
       this.log(`handleTelegramCommand: rejected because not owner (isOwner=${isOwner}, kind=${command.command.kind})`);
       await this.telegram.sendMessage(
@@ -299,12 +406,22 @@ export class BridgeController {
       return;
     }
 
+    if (command.command.kind === "question") {
+      await this.handleQuestionCommand(command);
+      return;
+    }
+
     if (command.command.kind === "status") {
       await this.telegram.sendMessage(
         this.config.channelID,
         await this.statusLine(),
         { replyToMessageID: command.messageID },
       );
+      return;
+    }
+
+    if (command.command.kind === "diag") {
+      await this.handleDiag(command);
       return;
     }
 
@@ -679,13 +796,21 @@ export class BridgeController {
       );
       const completedAt = this.deps.now();
       const elapsed = completedAt - (state.activePrompt.startedAt ?? state.activePrompt.createdAt);
-      const resultText = formatSummaryForTelegram(summary, this.config.summaryMaxChars);
-      const combinedMessage = `✅ completed in ${formatAgeMs(Math.max(0, elapsed))}\n\n${resultText}`;
-      await this.telegram.sendMessage(
-        this.config.channelID,
-        combinedMessage,
-        { replyToMessageID: state.activePrompt.telegramMessageID },
-      );
+
+      const hasContent = summary.text.trim().length > 0 || summary.changedFiles.length > 0;
+      if (hasContent) {
+        const resultText = formatSummaryForTelegram(summary, this.config.summaryMaxChars);
+        const combinedMessage = `✅ completed in ${formatAgeMs(Math.max(0, elapsed))}\n\n${resultText}`;
+        await this.telegram.sendMessage(
+          this.config.channelID,
+          combinedMessage,
+          { replyToMessageID: state.activePrompt.telegramMessageID },
+        );
+      } else {
+        this.log(
+          `completeActivePrompt: assistant produced no text and no file changes; skipping Telegram notification for userMessageID=${state.activePrompt.userMessageID}`,
+        );
+      }
 
       await this.persist(
         this.appendPromptHistory(
@@ -708,6 +833,18 @@ export class BridgeController {
     } finally {
       this.completionInFlight = false;
     }
+  }
+
+  private async onMessagePartUpdated(input: {
+    sessionID: string;
+    messageID: string;
+    part: { type: string; text?: string; [key: string]: unknown };
+    delta?: string;
+  }): Promise<void> {
+    if (input.part.type !== "text") return;
+    const text = input.part.text;
+    if (typeof text !== "string") return;
+    this.streamedText.set(input.messageID, text);
   }
 
   private async onUserMessage(
@@ -741,8 +878,18 @@ export class BridgeController {
     metadata: Record<string, unknown>;
   }): Promise<void> {
     const state = await this.syncState();
-    if (!this.lease.isOwner(state)) return;
-    if (state.bound.sessionID !== input.sessionID) return;
+    if (!this.lease.isOwner(state)) {
+      this.log(`onPermissionAsked: dropped because not owner (id=${input.id})`);
+      return;
+    }
+    if (state.bound.sessionID !== input.sessionID) {
+      this.log(`onPermissionAsked: dropped because session mismatch (bound=${state.bound.sessionID}, event=${input.sessionID})`);
+      return;
+    }
+    if (state.pendingPermissions[input.id]) {
+      this.log(`onPermissionAsked: dropped because already pending (id=${input.id})`);
+      return;
+    }
     const pending = toPendingPermission(input);
     const next = {
       ...state,
@@ -753,16 +900,41 @@ export class BridgeController {
     };
     await this.persist(next);
     const activeReplyTo = state.activePrompt?.telegramMessageID;
-    await this.telegram.sendMessage(
-      this.config.channelID,
+    await this.safeSendTelegram(
+      "onPermissionAsked: waiting",
       "waiting-permission",
       activeReplyTo ? { replyToMessageID: activeReplyTo } : undefined,
     );
-    await this.telegram.sendMessage(
-      this.config.channelID,
-      formatPermissionRequestMessage(this.config.prefix, pending),
-      activeReplyTo ? { replyToMessageID: activeReplyTo } : undefined,
+    let detailMessage = "";
+    let keyboard: TelegramInlineKeyboardMarkup = { inline_keyboard: [] };
+    try {
+      detailMessage = formatPermissionRequestMessage(this.config.prefix, pending);
+      keyboard = buildPermissionKeyboard(pending.requestID);
+    } catch (formatError) {
+      this.log(`onPermissionAsked: format/build failed: ${String(formatError)}`);
+      await this.safeSendTelegram(
+        "onPermissionAsked: detail (fallback)",
+        `OpenCode permission request (id=${pending.requestID}) — formatting failed.`,
+        activeReplyTo ? { replyToMessageID: activeReplyTo } : undefined,
+      );
+      return;
+    }
+    await this.safeSendTelegram(
+      "onPermissionAsked: detail",
+      detailMessage,
+      {
+        replyToMessageID: activeReplyTo,
+        replyMarkup: keyboard,
+      },
     );
+  }
+
+  private async onPermissionReplied(requestID: string): Promise<void> {
+    const state = await this.syncState();
+    if (!this.lease.isOwner(state)) return;
+    if (!state.pendingPermissions[requestID]) return;
+    const { [requestID]: _removed, ...rest } = state.pendingPermissions;
+    await this.persist({ ...state, pendingPermissions: rest });
   }
 
   private async handlePermissionReply(
@@ -788,7 +960,13 @@ export class BridgeController {
       );
       return;
     }
-    await replyPermission(this.client, pending.sessionID, requestID, action);
+    await replyPermission(
+      this.client,
+      pending.sessionID,
+      requestID,
+      action,
+      this.api.state.path.directory,
+    );
     const { [requestID]: _removed, ...rest } = state.pendingPermissions;
     await this.persist({
       ...state,
@@ -799,6 +977,399 @@ export class BridgeController {
       `Permission ${requestID} -> ${action}`,
       replyToMessageID ? { replyToMessageID } : undefined,
     );
+  }
+
+  private async handleTelegramCallback(callback: ParsedCallbackQuery): Promise<void> {
+    this.log(
+      `handleTelegramCallback: kind=${callback.command.kind}, action=${(callback.command as { action?: string }).action}, requestID=${(callback.command as { requestID?: string }).requestID}, messageID=${callback.messageID}`,
+    );
+    try {
+      await this.telegram.answerCallbackQuery(callback.callbackQueryID);
+    } catch (err) {
+      this.log(`handleTelegramCallback: answerCallbackQuery failed: ${String(err)}`);
+    }
+    try {
+      if (callback.command.kind === "permission") {
+        await this.handlePermissionReply(
+          callback.command.requestID,
+          callback.command.action,
+        );
+        await this.telegram.editMessageReplyMarkup(
+          this.requireChannelID(),
+          callback.messageID,
+          undefined,
+        );
+        return;
+      }
+      if (callback.command.kind === "question") {
+        await this.handleCallbackQuestion(callback);
+        return;
+      }
+    } catch (err) {
+      this.log(`handleTelegramCallback: dispatch failed: ${String(err)}`);
+    }
+  }
+
+  private async handleCallbackQuestion(callback: ParsedCallbackQuery): Promise<void> {
+    const command = callback.command as Extract<typeof callback.command, { kind: "question" }>;
+    if (command.action === "reject") {
+      await this.handleQuestionReject(command.requestID, callback.messageID);
+      await this.telegram.editMessageReplyMarkup(
+        this.requireChannelID(),
+        callback.messageID,
+        undefined,
+      );
+      return;
+    }
+    if (command.action === "reply") {
+      const state = await this.syncState();
+      const pending = state.pendingQuestions[command.requestID];
+      if (!pending) {
+        await this.telegram.sendMessage(
+          this.config.channelID,
+          `Question request not found: ${command.requestID}`,
+          { replyToMessageID: callback.messageID },
+        );
+        return;
+      }
+      const qIndex = command.questionIndex ?? 0;
+      const optIndex = command.optionIndex ?? -1;
+      const info = pending.questions[qIndex];
+      const option = info?.options[optIndex];
+      if (!info || !option) {
+        await this.telegram.sendMessage(
+          this.config.channelID,
+          `Question option no longer valid for request ${command.requestID}.`,
+          { replyToMessageID: callback.messageID },
+        );
+        return;
+      }
+      const answers: PendingQuestionAnswer[] = pending.questions.map((_, idx) => {
+        if (idx === qIndex) {
+          return { questionIndex: idx, labels: [option.label] };
+        }
+        return { questionIndex: idx, labels: [] };
+      });
+      await this.handleQuestionReply(pending, answers, callback.messageID);
+      await this.telegram.editMessageReplyMarkup(
+        this.requireChannelID(),
+        callback.messageID,
+        undefined,
+      );
+      return;
+    }
+    if (command.action === "toggle") {
+      await this.handleQuestionToggle(
+        command.requestID,
+        command.questionIndex ?? 0,
+        command.optionIndex ?? -1,
+        callback.messageID,
+        callback.channelID,
+      );
+      return;
+    }
+    if (command.action === "confirm") {
+      await this.handleQuestionConfirm(
+        command.requestID,
+        command.questionIndex ?? 0,
+        callback.messageID,
+      );
+      await this.telegram.editMessageReplyMarkup(
+        this.requireChannelID(),
+        callback.messageID,
+        undefined,
+      );
+      return;
+    }
+  }
+
+  private async handleQuestionToggle(
+    requestID: string,
+    questionIndex: number,
+    optionIndex: number,
+    messageID: number,
+    channelID: string,
+  ): Promise<void> {
+    const state = await this.syncState();
+    if (!this.lease.isOwner(state)) return;
+    const pending = state.pendingQuestions[requestID];
+    if (!pending) {
+      await this.telegram.sendMessage(
+        channelID,
+        `Question request not found: ${requestID}`,
+        { replyToMessageID: messageID },
+      );
+      return;
+    }
+    const info = pending.questions[questionIndex];
+    if (!info) return;
+    const option = info.options[optionIndex];
+    if (!option) return;
+    const previous = state.questionAnswers[requestID] ?? [];
+    const updated: PendingQuestionAnswer[] = pending.questions.map((_, idx) => {
+      const existing = previous.find((a) => a.questionIndex === idx);
+      if (idx !== questionIndex) {
+        return existing ?? { questionIndex: idx, labels: [] };
+      }
+      const labels = existing ? [...existing.labels] : [];
+      const at = labels.indexOf(option.label);
+      if (at >= 0) labels.splice(at, 1);
+      else labels.push(option.label);
+      return { questionIndex: idx, labels };
+    });
+    await this.persist({
+      ...state,
+      questionAnswers: {
+        ...state.questionAnswers,
+        [requestID]: updated,
+      },
+    });
+    const selected = updated[questionIndex]?.labels ?? [];
+    const keyboard = buildQuestionKeyboard({
+      requestID,
+      questionIndex,
+      options: info.options,
+      selectedLabels: selected,
+      multiple: info.multiple === true,
+    });
+    try {
+      await this.telegram.editMessageReplyMarkup(
+        channelID,
+        messageID,
+        keyboard,
+      );
+    } catch (err) {
+      this.log(`handleQuestionToggle: editMessageReplyMarkup failed: ${String(err)}`);
+    }
+  }
+
+  private async handleQuestionConfirm(
+    requestID: string,
+    questionIndex: number,
+    messageID: number,
+  ): Promise<void> {
+    const state = await this.syncState();
+    if (!this.lease.isOwner(state)) return;
+    const pending = state.pendingQuestions[requestID];
+    if (!pending) {
+      await this.telegram.sendMessage(
+        this.config.channelID,
+        `Question request not found: ${requestID}`,
+        { replyToMessageID: messageID },
+      );
+      return;
+    }
+    const previous = state.questionAnswers[requestID] ?? [];
+    const answers: PendingQuestionAnswer[] = pending.questions.map((_, idx) => {
+      const found = previous.find((a) => a.questionIndex === idx);
+      return found ?? { questionIndex: idx, labels: [] };
+    });
+    if (answers[questionIndex]?.labels.length === 0) {
+      await this.telegram.sendMessage(
+        this.config.channelID,
+        "Pick at least one option before confirming.",
+        { replyToMessageID: messageID },
+      );
+      return;
+    }
+    await this.handleQuestionReply(pending, answers, messageID);
+  }
+
+  private async handleQuestionCommand(command: ParsedTelegramCommand): Promise<void> {
+    const cmd = command.command as Extract<typeof command.command, { kind: "question" }>;
+    if (cmd.action === "reject") {
+      await this.handleQuestionReject(cmd.requestID, command.messageID);
+      return;
+    }
+    if (cmd.action === "reply") {
+      if (!cmd.answers) return;
+      const state = await this.syncState();
+      const pending = state.pendingQuestions[cmd.requestID];
+      if (!pending) {
+        await this.telegram.sendMessage(
+          this.config.channelID,
+          `Question request not found: ${cmd.requestID}`,
+          { replyToMessageID: command.messageID },
+        );
+        return;
+      }
+      await this.handleQuestionReply(pending, cmd.answers, command.messageID);
+      return;
+    }
+  }
+
+  private async handleQuestionReply(
+    pending: PendingQuestion,
+    answers: PendingQuestionAnswer[],
+    replyToMessageID?: number,
+  ): Promise<void> {
+    const state = await this.syncState();
+    if (!this.lease.isOwner(state)) {
+      await this.telegram.sendMessage(
+        this.config.channelID,
+        "Cannot answer question: this instance is not the current bridge owner.",
+        replyToMessageID ? { replyToMessageID } : undefined,
+      );
+      return;
+    }
+    const normalized = normalizeAnswers(pending, answers);
+    try {
+      await replyQuestion(
+        this.client,
+        this.api.state.path.directory,
+        pending.requestID,
+        normalized,
+      );
+    } catch (err) {
+      await this.telegram.sendMessage(
+        this.config.channelID,
+        `Question reply failed: ${String(err)}`,
+        replyToMessageID ? { replyToMessageID } : undefined,
+      );
+      return;
+    }
+    const { [pending.requestID]: _q, ...remaining } = state.pendingQuestions;
+    const { [pending.requestID]: _a, ...remainingAnswers } = state.questionAnswers;
+    await this.persist({
+      ...state,
+      pendingQuestions: remaining,
+      questionAnswers: remainingAnswers,
+    });
+    const summary = normalized
+      .map((labels, idx) => `Q${idx + 1}: ${labels.join(", ") || "(skipped)"}`)
+      .join("\n");
+    await this.telegram.sendMessage(
+      this.config.channelID,
+      `Question ${pending.requestID} -> replied\n${summary}`,
+      replyToMessageID ? { replyToMessageID } : undefined,
+    );
+  }
+
+  private async handleQuestionReject(
+    requestID: string,
+    replyToMessageID?: number,
+  ): Promise<void> {
+    const state = await this.syncState();
+    if (!this.lease.isOwner(state)) {
+      await this.telegram.sendMessage(
+        this.config.channelID,
+        "Cannot reject question: this instance is not the current bridge owner.",
+        replyToMessageID ? { replyToMessageID } : undefined,
+      );
+      return;
+    }
+    const pending = state.pendingQuestions[requestID];
+    if (!pending) {
+      await this.telegram.sendMessage(
+        this.config.channelID,
+        `Question request not found: ${requestID}`,
+        replyToMessageID ? { replyToMessageID } : undefined,
+      );
+      return;
+    }
+    try {
+      await rejectQuestion(this.client, this.api.state.path.directory, requestID);
+    } catch (err) {
+      await this.telegram.sendMessage(
+        this.config.channelID,
+        `Question reject failed: ${String(err)}`,
+        replyToMessageID ? { replyToMessageID } : undefined,
+      );
+      return;
+    }
+    const { [requestID]: _q, ...remaining } = state.pendingQuestions;
+    const { [requestID]: _a, ...remainingAnswers } = state.questionAnswers;
+    await this.persist({
+      ...state,
+      pendingQuestions: remaining,
+      questionAnswers: remainingAnswers,
+    });
+    await this.telegram.sendMessage(
+      this.config.channelID,
+      `Question ${requestID} -> rejected`,
+      replyToMessageID ? { replyToMessageID } : undefined,
+    );
+  }
+
+  private async onQuestionAsked(input: {
+    id: string;
+    sessionID: string;
+    questions: import("../types.js").QuestionInfo[];
+    tool?: { messageID: string; callID: string };
+  }): Promise<void> {
+    const state = await this.syncState();
+    if (!this.lease.isOwner(state)) {
+      this.log(`onQuestionAsked: dropped because not owner (id=${input.id})`);
+      return;
+    }
+    if (state.bound.sessionID !== input.sessionID) {
+      this.log(`onQuestionAsked: dropped because session mismatch (bound=${state.bound.sessionID}, event=${input.sessionID})`);
+      return;
+    }
+    if (state.pendingQuestions[input.id]) {
+      this.log(`onQuestionAsked: dropped because already pending (id=${input.id})`);
+      return;
+    }
+    const pending = toPendingQuestion(input);
+    const next = {
+      ...state,
+      pendingQuestions: {
+        ...state.pendingQuestions,
+        [pending.requestID]: pending,
+      },
+    };
+    await this.persist(next);
+
+    const activeReplyTo = state.activePrompt?.telegramMessageID;
+    await this.safeSendTelegram(
+      "onQuestionAsked: waiting",
+      "waiting-question",
+      activeReplyTo ? { replyToMessageID: activeReplyTo } : undefined,
+    );
+
+    for (let i = 0; i < pending.questions.length; i++) {
+      const info = pending.questions[i];
+      let message = "";
+      let keyboard: TelegramInlineKeyboardMarkup = { inline_keyboard: [] };
+      try {
+        message = formatQuestionRequestMessage(pending, i);
+        keyboard = buildQuestionKeyboard({
+          requestID: pending.requestID,
+          questionIndex: i,
+          options: info.options,
+          selectedLabels: [],
+          multiple: info.multiple === true,
+        });
+      } catch (formatError) {
+        this.log(`onQuestionAsked: format/build failed for question ${i}: ${String(formatError)}`);
+        continue;
+      }
+      await this.safeSendTelegram(
+        `onQuestionAsked: detail[${i}]`,
+        message,
+        {
+          replyToMessageID: activeReplyTo,
+          replyMarkup: keyboard,
+        },
+      );
+    }
+  }
+
+  private async onQuestionReplied(input: { id: string; sessionID: string }): Promise<void> {
+    const state = await this.syncState();
+    if (!this.lease.isOwner(state)) return;
+    if (!state.pendingQuestions[input.id]) return;
+    const { [input.id]: _q, ...remaining } = state.pendingQuestions;
+    const { [input.id]: _a, ...remainingAnswers } = state.questionAnswers;
+    await this.persist({
+      ...state,
+      pendingQuestions: remaining,
+      questionAnswers: remainingAnswers,
+    });
+  }
+
+  private async onQuestionRejected(input: { id: string; sessionID: string }): Promise<void> {
+    await this.onQuestionReplied(input);
   }
 
   private async handleModelCommand(
@@ -926,19 +1497,69 @@ export class BridgeController {
     userMessageID: string,
     directParts?: ReadonlyArray<{ type: string; [key: string]: unknown }>,
   ): Promise<SummaryPayload> {
-    const parts = directParts ?? this.api.state.part(assistantMessageID);
-    const text = parts
-      .filter((part): part is { type: "text"; text: string } => {
-        return part.type === "text" && typeof part.text === "string";
-      })
-      .map((part) => part.text)
-      .join("")
-      .trim();
+    const textFromParts = (parts: ReadonlyArray<{ type: string; [key: string]: unknown }> | undefined): string => {
+      if (!parts) return "";
+      return parts
+        .filter((part): part is { type: "text"; text: string } => {
+          return part.type === "text" && typeof part.text === "string";
+        })
+        .map((part) => part.text)
+        .join("")
+        .trim();
+    };
+
+    // Source 0: streamed text accumulator (from message.part.updated events).
+    // This is the most reliable because it accumulates as the model generates
+    // text and bypasses both the SDK fetch (which can 500) and the TUI state
+    // (which may be empty for bridge-originated messages).
+    let text = this.streamedText.get(assistantMessageID)?.trim() ?? "";
+    let source: "streamed" | "direct" | "tui" | "sdk" | "none" = text ? "streamed" : "none";
+
+    // Source 1: parts passed in from the polling loop (may be undefined or
+    // partial depending on the server's response shape for session.messages()).
+    if (!text) {
+      text = textFromParts(directParts);
+      if (text) source = "direct";
+    }
+
+    // Source 2: TUI plugin's local state (fast, but only has parts the TUI
+    // itself has rendered, so may be empty for bridge-originated messages).
+    if (!text) {
+      try {
+        text = textFromParts(this.api.state.part(assistantMessageID));
+        if (text) source = "tui";
+      } catch (err) {
+        this.log(`buildSummary: api.state.part failed: ${String(err)}`);
+      }
+    }
+
+    // Source 3: dedicated single-message SDK fetch. The v1 SDK's URL template
+    // is /session/{id}/message/{messageID}, so we pass `id` and `messageID`
+    // flat (NOT under a `path` wrapper) so the SDK's path substitution works.
+    if (!text) {
+      try {
+        const response = await this.client.session.message(
+          { id: sessionID, messageID: assistantMessageID },
+          { responseStyle: "data", throwOnError: true },
+        );
+        const parts = (response as any)?.parts as Array<{ type: string; [key: string]: unknown }> | undefined;
+        text = textFromParts(parts);
+        if (text) source = "sdk";
+        this.log(`buildSummary: SDK fetch returned ${parts?.length ?? 0} parts, text length=${text.length}`);
+      } catch (err) {
+        this.log(`buildSummary: SDK message fetch failed: ${String(err)}`);
+      }
+    }
+
+    this.log(`buildSummary: assistantMessageID=${assistantMessageID} text source=${source} length=${text.length} streamedMapSize=${this.streamedText.size}`);
+
+    // Drop the entry from the accumulator so we don't leak memory.
+    this.streamedText.delete(assistantMessageID);
 
     let changedFiles: string[] = [];
     try {
       const diffResponse = await this.client.session.message(
-        { sessionID, messageID: userMessageID, directory: this.api.state.path.directory },
+        { id: sessionID, messageID: userMessageID },
         { responseStyle: "data", throwOnError: true },
       );
       const diff = (diffResponse as any)?.diff as Array<{ file: string }> | undefined;
@@ -948,7 +1569,7 @@ export class BridgeController {
     }
 
     return {
-      text: text || "(assistant completed with no text output)",
+      text,
       changedFiles,
     };
   }
@@ -1483,6 +2104,7 @@ export class BridgeController {
 
   private startPolling(): void {
     if (this.pollTask) return;
+    this.log("startPolling: beginning Telegram long-polling");
     const telegram = this.getTelegramApi();
     this.pollAbort = new AbortController();
     const poller = new TelegramPoller(
@@ -1503,7 +2125,11 @@ export class BridgeController {
             message: `Teleprompt: received ${count} Telegram updates`,
           });
         },
+        onLog: (message) => {
+          this.log(message);
+        },
         onError: (error) => {
+          this.log(`Telegram polling error: ${String(error)}`);
           this.api.ui.toast({
             variant: "warning",
             message: `Telegram polling error: ${String(error)}`,
@@ -1523,18 +2149,25 @@ export class BridgeController {
       this.eventRestartTimer = undefined;
     }
     await this.eventStream?.stop();
-    this.eventStream = new SessionEventStream(this.client, sessionID, {
+    this.eventStream = new SessionEventStream(this.client, sessionID, this.api.state.path.directory, {
       onAssistantCompleted: (sid, assistantID, parentID) =>
         this.onAssistantCompleted(sid, assistantID, parentID),
       onPermissionAsked: (event) => this.onPermissionAsked(event),
+      onPermissionReplied: (requestID) => this.onPermissionReplied(requestID),
+      onQuestionAsked: (event) => this.onQuestionAsked(event),
+      onQuestionReplied: (event) => this.onQuestionReplied(event),
+      onQuestionRejected: (event) => this.onQuestionRejected(event),
       onSessionError: (event) => this.onSessionError(event),
       onUserMessage: (sid, msgID) => this.onUserMessage(sid, msgID),
+      onMessagePartUpdated: (input) => this.onMessagePartUpdated(input),
       onStreamError: (error) => this.onEventStreamError(sessionID, error),
-    });
+    }, (msg) => this.log(`eventStream: ${msg}`));
     this.eventStream.start();
+    this.streamedText.clear();
   }
 
   private async onEventStreamError(sessionID: string, error: unknown): Promise<void> {
+    this.log(`onEventStreamError: ${String(error)}`);
     this.eventStream = undefined;
     this.api.ui.toast({
       variant: "warning",
@@ -1653,6 +2286,7 @@ export class BridgeController {
     this.pollTask = undefined;
     await this.eventStream?.stop();
     this.eventStream = undefined;
+    this.streamedText.clear();
 
     if (!clearJobs) return;
     const state = await this.requireState();
@@ -1661,6 +2295,8 @@ export class BridgeController {
       activePrompt: undefined,
       promptQueue: [],
       pendingPermissions: {},
+      pendingQuestions: {},
+      questionAnswers: {},
     });
   }
 
@@ -1697,6 +2333,8 @@ export class BridgeController {
       activePrompt: undefined,
       promptQueue: [],
       pendingPermissions: {},
+      pendingQuestions: {},
+      questionAnswers: {},
       promptHistory: [],
       recentPrompts: [],
     };
@@ -1892,5 +2530,41 @@ export class BridgeController {
         },
       ),
     );
+  }
+
+  /**
+   * Test-only hooks. Exposed as a single object so production code never
+   * reaches for these methods and tests can drive the controller
+   * deterministically without spinning up the full TUI lifecycle.
+   */
+  get __test(): {
+    onPermissionAsked: BridgeController["onPermissionAsked"];
+    onQuestionAsked: BridgeController["onQuestionAsked"];
+    onQuestionReplied: BridgeController["onQuestionReplied"];
+    onQuestionRejected: BridgeController["onQuestionRejected"];
+    handleTelegramCallback: BridgeController["handleTelegramCallback"];
+    handleTelegramMessage: BridgeController["handleTelegramMessage"];
+    handleQuestionToggle: BridgeController["handleQuestionToggle"];
+    startEventStream: (sessionID: string) => Promise<void>;
+    setState: (next: BridgeStoreData) => Promise<void>;
+    syncState: () => Promise<BridgeStoreData>;
+    getStorePath: () => string;
+  } {
+    return {
+      onPermissionAsked: (input) => this.onPermissionAsked(input),
+      onQuestionAsked: (input) => this.onQuestionAsked(input),
+      onQuestionReplied: (input) => this.onQuestionReplied(input),
+      onQuestionRejected: (input) => this.onQuestionRejected(input),
+      handleTelegramCallback: (cb) => this.handleTelegramCallback(cb),
+      handleTelegramMessage: (msg) => this.handleTelegramMessage(msg),
+      handleQuestionToggle: (...args) => this.handleQuestionToggle(...args),
+      startEventStream: (sessionID) => this.startEventStream(sessionID),
+      setState: async (next) => {
+        this.data = next;
+        await this.store.save(next);
+      },
+      syncState: () => this.syncState(),
+      getStorePath: () => this.storePath,
+    };
   }
 }

@@ -1,9 +1,16 @@
 import type {
+  ParsedCallbackQuery,
   ParsedTelegramCommand,
+  TelegramCallbackQuery,
   TelegramChannelPost,
   TelegramCommand,
   TelegramUpdate,
 } from "../types.js";
+import {
+  decodeCallbackData,
+  decodeTextQuestionReject,
+  decodeTextQuestionReply,
+} from "./callback.js";
 
 function parseCommandBody(body: string): TelegramCommand | undefined {
   const trimmed = body.trim();
@@ -48,6 +55,9 @@ function parseCommandBody(body: string): TelegramCommand | undefined {
   const lastErrorMatch = /^last-error\s*$/i.exec(trimmed);
   if (lastErrorMatch) return { kind: "last-error" };
 
+  const diagMatch = /^diag(nostic)?\s*$/i.exec(trimmed);
+  if (diagMatch) return { kind: "diag" };
+
   const versionMatch = /^version\s*$/i.exec(trimmed);
   if (versionMatch) return { kind: "version" };
 
@@ -73,6 +83,52 @@ function parseCommandBody(body: string): TelegramCommand | undefined {
   const denyMatch = /^deny\s+([A-Za-z0-9_\-:.]+)\s*$/i.exec(trimmed);
   if (denyMatch) {
     return { kind: "permission", action: "reject", requestID: denyMatch[1] };
+  }
+
+  const qreplyMatch = /^qreply\s+([A-Za-z0-9_\-:.]+)/i.exec(trimmed);
+  if (qreplyMatch) {
+    const decoded = decodeTextQuestionReply(trimmed);
+    if (decoded && decoded.requestID === qreplyMatch[1]) {
+      return {
+        kind: "question",
+        action: "reply",
+        requestID: decoded.requestID,
+        answers: decoded.answers,
+      };
+    }
+  }
+
+  const ansMatch = /^ans(wer)?\s+([A-Za-z0-9_\-:.]+)\s+(.+)$/i.exec(trimmed);
+  if (ansMatch) {
+    const requestID = ansMatch[2];
+    const rawAnswer = ansMatch[3].trim();
+    // Support "0:Option" or "Option" format
+    const qIndexMatch = /^(\d+):(.+)$/.exec(rawAnswer);
+    const questionIndex = qIndexMatch ? Number(qIndexMatch[1]) : 0;
+    const label = qIndexMatch ? qIndexMatch[2].trim() : rawAnswer;
+    return {
+      kind: "question",
+      action: "reply",
+      requestID,
+      answers: [{ questionIndex, labels: [label] }],
+    };
+  }
+
+  const qrejectMatch = /^qreject\s+([A-Za-z0-9_\-:.]+)\s*$/i.exec(trimmed);
+
+  const skipMatch = /^skip\s+([A-Za-z0-9_\-:.]+)\s*$/i.exec(trimmed);
+  if (skipMatch) {
+    return { kind: "question", action: "reject", requestID: skipMatch[1] };
+  }
+  if (qrejectMatch) {
+    const decoded = decodeTextQuestionReject(trimmed);
+    if (decoded) {
+      return {
+        kind: "question",
+        action: "reject",
+        requestID: decoded.requestID,
+      };
+    }
   }
 
   const modelMatch = /^model(?:\s+([A-Za-z0-9_./-]+))?\s*$/i.exec(trimmed);
@@ -101,6 +157,17 @@ function parseCommandBody(body: string): TelegramCommand | undefined {
 }
 
 export function parseTelegramUpdate(
+  update: TelegramUpdate,
+  channelID: string,
+  prefix: string,
+): ParsedTelegramCommand | ParsedCallbackQuery | undefined {
+  if (update.callback_query) {
+    return parseCallbackQuery(update, channelID);
+  }
+  return parseChannelPost(update, channelID, prefix);
+}
+
+function parseChannelPost(
   update: TelegramUpdate,
   channelID: string,
   prefix: string,
@@ -177,6 +244,76 @@ export function parseTelegramUpdate(
   return undefined;
 }
 
+function parseCallbackQuery(
+  update: TelegramUpdate,
+  channelID: string,
+): ParsedCallbackQuery | undefined {
+  const query = update.callback_query;
+  if (!query) return undefined;
+  const message = query.message;
+  if (!message) return undefined;
+  const normalizedChannel = String(message.chat.id);
+  if (normalizedChannel !== channelID) return undefined;
+  const data = query.data;
+  if (!data) return undefined;
+
+  const decoded = decodeCallbackData(data);
+  if (decoded.kind === "unknown") return undefined;
+
+  let command: TelegramCommand | undefined;
+  if (decoded.kind === "permission") {
+    command = {
+      kind: "permission",
+      action: decoded.action,
+      requestID: decoded.requestID,
+    };
+  } else if (decoded.kind === "question") {
+    if (decoded.action === "reject") {
+      command = {
+        kind: "question",
+        action: "reject",
+        requestID: decoded.requestID,
+      };
+    } else if (decoded.action === "answer") {
+      // Single-choice: will be resolved to a full answer by the controller
+      // using the pending question's option labels. We pass the indices.
+      command = {
+        kind: "question",
+        action: "reply",
+        requestID: decoded.requestID,
+        questionIndex: decoded.questionIndex,
+        optionIndex: decoded.optionIndex,
+      };
+    } else if (decoded.action === "toggle") {
+      command = {
+        kind: "question",
+        action: "toggle",
+        requestID: decoded.requestID,
+        questionIndex: decoded.questionIndex,
+        optionIndex: decoded.optionIndex,
+      };
+    } else if (decoded.action === "confirm") {
+      command = {
+        kind: "question",
+        action: "confirm",
+        requestID: decoded.requestID,
+        questionIndex: decoded.questionIndex,
+      };
+    }
+  }
+
+  if (!command) return undefined;
+
+  return {
+    updateID: update.update_id,
+    callbackQueryID: query.id,
+    channelID: normalizedChannel,
+    messageID: message.message_id,
+    rawData: data,
+    command,
+  };
+}
+
 export function isChannelPostFromTarget(
   post: TelegramChannelPost | undefined,
   channelID: string,
@@ -185,3 +322,10 @@ export function isChannelPostFromTarget(
   return String(post.chat.id) === channelID;
 }
 
+export function isCallbackFromTarget(
+  query: TelegramCallbackQuery | undefined,
+  channelID: string,
+): boolean {
+  if (!query) return false;
+  return String(query.message?.chat.id ?? "") === channelID;
+}

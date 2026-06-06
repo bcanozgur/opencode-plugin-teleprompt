@@ -8,6 +8,8 @@ TUI-scoped OpenCode plugin that binds a Telegram channel to one active OpenCode 
 - **Direct Slash Commands**: Run administrative commands like `/status`, `/queue`, `/dc` or `/approve <id>` directly in the Telegram channel.
 - **Backward Compatibility**: Fully supports old `/tp <prompt>` and `/tp:<command>` syntax out of the box.
 - **Relays Permission Prompts**: Directly relays OpenCode permission requests and accepts direct `/approve`, `/approve-always`, and `/deny` replies.
+- **Inline Keyboards For Approvals**: Permission prompts arrive as Telegram messages with `Approve once` / `Approve always` / `Deny` buttons — no typing required.
+- **Relays OpenCode Questions**: When the agent asks the user a question (via the OpenCode `question` tool), teleprompt posts it to Telegram with inline option buttons (single-choice direct, multi-choice with toggle+confirm). Tap to reply, or fall back to `/qreply`/`/qreject` text commands.
 - **Lease-based Owner Semantics**: Keeps single-owner bridge semantics across multiple OpenCode consoles.
 - **Instant Ctrl+C Exit**: Stops event streams and cleans up instantly, ensuring no exit lags when shutting down OpenCode.
 
@@ -90,10 +92,12 @@ OpenCode installs npm plugins automatically at startup.
    - `/model smart` (or `/tp:model smart`)
    - `/model max` (or `/tp:model max`)
    - `/model <provider>/<model>`
-   - `/approve <request_id>`
-   - `/approve-always <request_id>`
-   - `/deny <request_id>`
-   - `/status`
+    - `/approve <request_id>`
+    - `/approve-always <request_id>`
+    - `/deny <request_id>`
+    - `/qreply <request_id>` (then `<index>:<label1>|<label2>` lines for each question)
+    - `/qreject <request_id>`
+    - `/status`
    - `/dc` (or `/tp:dc`)
 
 During remote runs, teleprompt posts lifecycle updates (`accepted`, `queued`, `running`, `waiting-permission`, `completed`, `failed`) and result summaries are sent as replies to the originating Telegram message for clear correlation.
@@ -133,10 +137,21 @@ During remote runs, teleprompt posts lifecycle updates (`accepted`, `queued`, `r
    - `accepted` -> `running` -> `completed`
    - summary arrives as reply to the same Telegram message
 5. Trigger a permissioned action prompt and verify:
-   - plugin posts permission request with `request_id`
-   - `/approve <request_id>` (or `/deny <request_id>`) is applied immediately
-6. Send `/interrupt` during a long run and confirm graceful stop.
-7. Send `/dc` and confirm disconnect/unlock behavior.
+   - plugin posts a permission request message with `Approve once`,
+     `Approve always`, and `Deny` inline buttons
+   - tapping a button (or typing `/approve <request_id>` / `/deny <request_id>`)
+     applies the reply via the OpenCode SDK and removes the buttons
+6. Trigger an OpenCode question (e.g. "what's the goal?") and verify:
+   - plugin posts a `waiting-question` notice and the question with
+     inline option buttons
+   - single-choice: tapping an option button replies via
+     `client.question.reply` and removes the buttons
+   - multi-choice: toggling options marks them with ✅ and a `Confirm`
+     button finalizes the reply with all selected labels
+   - text fallback: `/qreply <request_id>` with one
+     `<index>:<label1>|<label2>` line per question
+7. Send `/interrupt` during a long run and confirm graceful stop.
+8. Send `/dc` and confirm disconnect/unlock behavior.
 
 ## Command Reference
 
@@ -172,6 +187,11 @@ During remote runs, teleprompt posts lifecycle updates (`accepted`, `queued`, `r
 - `/approve <request_id>`: Approve a pending permission request once.
 - `/approve-always <request_id>`: Approve a pending permission request and persist approval behavior when supported.
 - `/deny <request_id>`: Reject a pending permission request.
+- `/qreply <request_id>`: Answer an OpenCode question. Follow with one line per
+  question in the form `<index>:<label1>|<label2>`. Only known option labels
+  are accepted; unknown labels are dropped. As a fallback to the inline
+  keyboard buttons, you can also use this for single-choice questions.
+- `/qreject <request_id>`: Reject an OpenCode question without answering it.
 - `/status`: Show bridge status from Telegram.
 - `/dc`: Disconnect teleprompt from Telegram and unbind the current session.
 
